@@ -1,4 +1,306 @@
+<!--- If not from the select page or mothership app then redirect --->
+<cfif !IsDefined("FORM.rpt_type") && !IsDefined("URL.scope")>
+    <cflocation url="avar_select.cfm" addtoken="false" />
+</cfif>
+<cfsetting requestTimeOut = "600" />
+<cfset thisApp = "cdv" />
+<CF_TrackerII PID=4>
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<meta name="title" content="USPS - Variance Programs" />
+<meta name="author" content="Field Operations Support" />
+<meta http-equiv="Cache-Control" content="no-cache" />
+<meta http-equiv="Cache-Control" content="no-store" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta name="expires" content="-1" />
+<title>CDV Executive Summary</title>
+<script src="/scripts/tablesort.js"></script>
+<cfoutput>
+<link rel=stylesheet type="text/css" href="/css/avar_tablesort_v2.css?ts=#DateFormat(Now(),'yyyymmdd')##TimeFormat(Now(), 'hhmmssL')#" />
+</cfoutput>
+<style>
+table {
+    border-collapse: collapse;
+    border: 1px solid #ccc;
+}
 
+td {
+    border: 1px solid #ccc;
+    padding-left: 3px;
+    padding-right: 3px;
+}
+
+label {
+    cursor: help;
+}
+
+#retainer {
+    width: 95%;
+    margin-right: auto;
+    margin-left: auto;
+}
+</style>
+</head>
+<body>
+    <cftry>
+<div id="retainer">
+
+<cfparam name="scope"         default="" />
+<cfparam name="beginPeriod"   default="" />
+<cfparam name="endPeriod"     default="" />
+<cfparam name="sqlWhere"      default="" />
+<cfparam name="reportingName" default="" />
+<cfparam name="requestType"   default="URL" />
+
+<cfset requestArgs  = StructNew() />
+<cfset thisTemplate = ListLast(CGI.SCRIPT_NAME, "/") />
+
+<!--- Determine if request is from select (FORM) or mothership (URL) --->
+<Cfif IsDefined("FORM.rpt_type") && (FORM.rpt_type EQ "canned" || FORM.rpt_type EQ "adHoc")>
+    <cfset requestType = "FORM" />
+    <cfset requestArgs = FORM />
+    <cfif requestArgs.rpt_type EQ "canned"> <!--- belt/suspenders force to numeric --->
+        <cfset beginPeriod = (Left(requestArgs.canned_range, 6) * 1) />
+        <cfset endPeriod   = (Right(requestArgs.canned_range, 6) * 1) />
+    <cfelse> <!--- belt/suspenders force to numeric --->
+        <cfset beginPeriod = requestArgs.beg_period * 1 />
+        <cfset endPeriod   = requestArgs.end_period * 1 />
+    </cfif>
+<cfelse> <!--- URL scope --->
+    <cfset requestArgs = URL />
+    <cfset beginPeriod = requestArgs.beginPeriod />
+    <cfset endPeriod = requestArgs.endPeriod />
+</cfif>
+
+<!--- In case the user selects a backwards in time range --->
+<cfset tmpSwap = 0 />
+<cfif beginPeriod GT endPeriod>
+    <cfset tmpSwap     = endPeriod />
+    <cfset endPeriod   = beginPeriod />
+    <cfset beginPeriod = tmpSwap />
+</cfif>
+
+<cfset objCDV        = New avar_cdv() />
+<cfset scopeData     = objCDV.getSummaryScopeData(requestArgs, requestType) />
+<cfset begEndDates   = objCDV.getBegEndDates(beginPeriod, endPeriod) />
+<cfset nbrWeeks      = objCDV.getWeeksCount(beginPeriod, endPeriod) />
+<cfset scope         = scopeData.scope />
+<cfset thisArea      = scopeData.area />
+<cfset thisCluster   = scopeData.cluster />
+<cfset thisMPOO      = scopeData.mpoo />
+<cfset thisUnit      = scopeData.unit />
+<cfset reportingName = scopeData.reportDescription />
+<cfset begDate       = begEndDates.begin_date />
+<cfset endDate       = begEndDates.end_date />
+<cfset delDays       = objCDV.getDelDays(beginPeriod, endPeriod) />
+
+<!--- For the data query --->
+<cfswitch expression="#scope#">
+    <cfcase value="unit">
+        <cfset sqlWhere = "b_lead_fin_nbr = '#thisUnit#'" />
+    </cfcase>
+    <cfcase value="mpoo">
+        <cfset sqlWhere = "b_cluster = '#thisCluster#' AND b_mpoo = '#thisMPOO#'" />
+    </cfcase>
+    <cfcase value="cluster">
+        <cfset sqlWhere = "b_cluster = '#thisCluster#'" />
+    </cfcase>
+    <cfcase value="area">
+        <cfset sqlWhere = "b_area = '#thisArea#'" />
+    </cfcase>
+    <cfcase value="nata">
+        <cfset reportingName = "National Areas" />
+    </cfcase>
+    <cfdefaultcase>
+        <cfset reportingName = "National Clusters" />
+    </cfdefaultcase>
+</cfswitch>
+
+<!--- Pull the Data --->
+<cfif scope EQ "nata">
+    <cfset Formula = objCDV.formulaArea(beginPeriod, endPeriod) />
+<cfelseif scope EQ "natc">
+    <cfset Formula = objCDV.formulaCluster(beginPeriod, endPeriod) />
+<cfelse>
+    <cfset Formula = objCDV.formula(beginPeriod, endPeriod, sqlWhere) />
+</cfif>
+
+<!--- Build the URL base string --->
+<cfset urlParms = "?scope=#scope#&beginPeriod=#beginPeriod#&endPeriod=#endPeriod#" />
+<cfif thisArea NEQ "">
+    <cfset urlParms &= "&area=#thisArea#" />
+</cfif>
+<cfif thisCluster NEQ "">
+    <cfset urlParms &= "&cluster=#thisCluster#" />
+</cfif>
+<cfif thisMPOO NEQ "">
+    <cfset urlParms &= "&mpoo=#thisMPOO#" />
+</cfif>
+<cfset exportParms = urlParms /> <!--- Don't add Unit to page records parms; will double it up --->
+<cfif scope EQ "unit"> <!--- need this for export if unit level --->
+    <cfset exportParms &= "&unit=#thisUnit#" />
+</cfif>
+
+<cfquery name="PCTS" datasource="#APPLICATION.dsn#">
+        SELECT top 1 CAST(b_prod_dps_pct*100 AS DECIMAL(9,0)) dpsPCT, CAST(b_prod_fss_pct*100 AS DECIMAL(9,0)) fssPCT,
+            pctSTND=(SELECT CAST(prod_pct_standard*100 AS DECIMAL(9,0)) FROM #APPLICATION.dsn2#.dbo.avar_cdv_prod WITH(NOLOCK))
+        FROM #APPLICATION.dsn#.dbo.var_base WITH(NOLOCK)
+        ORDER BY b_prod_dps_pct DESC
+    </cfquery>
+
+    <!--- Format Data --->
+    <cfset totOfc = 0 />
+    <cfset totStr = 0 />
+    <cfset totOth = 0 />
+    <cfset totOpp = 0 />
+    <cfset totfters = 0 />
+    <cfoutput query = "formula">
+        <cfset totOfc   += dly_ofc_opp />
+        <cfset totStr   += dly_str_opp />
+        <cfset totOth   += dly_oth_opp />
+        <cfset totOpp   += dly_tot_opp />
+        <cfset totfters += dly_fters_opp />
+    </cfoutput>
+
+
+    <!--- ******************************************************************************************* --->
+    <!---                                      Display Summary                                        --->
+    <!--- ******************************************************************************************* --->
+
+<table width="100%" border="1" cellpadding="0" cellspacing="0" align="center">
+    <tr>
+    <td bgcolor="003366" height="25" align="center" colspan="5">
+    <font face="verdana,arial,helvetica" color="#ffffff" size="2"><b>
+    <cfoutput>
+        City Delivery Variance Summary <br />
+        #reportingName#&nbsp;&nbsp;
+        #delDays# Customer Service Days&nbsp;&nbsp;
+        #begDate#&nbsp;to&nbsp;#endDate#
+    </b></font></td>
+    </tr>
+    <tr bgcolor="003366">
+        <td width="23%" align="center" bgcolor="#iif(totfters GT 0, DE('FF0000'), DE('33CC00'))#"><font face="Verdana" size="2" color="FFFFFF"><b>&nbsp;
+           CDPOM:&nbsp;#NumberFormat(totfters, "9,999.0")#</b></font></td>
+         <td width="18%" align="center">
+            <font face="Verdana" size="2" color="FFFFFF"><b>&nbsp;
+           Office Opp:&nbsp;#NumberFormat(totOfc, "9,999.0")#</b></font></td>
+         <td width="18%" align="center"><font face="Verdana" size="2" color="FFFFFF"><b>&nbsp;
+           Street Opp:&nbsp;#NumberFormat(totStr, "9,999.0")#</b></font></td>
+         <td width="18%" align="center"><font face="Verdana" size="2" color="FFFFFF"><b>&nbsp;
+           Other Opp:&nbsp;#NumberFormat(totOth, "9,999.0")#</b></font></td>
+          <td width="23%" align="center" bgcolor="#iif(totOpp GT 0, DE('FF0000'), DE('33CC00'))#"><font face="Verdana" size="2" color="FFFFFF"><b>&nbsp;
+           FTER Opportunity:&nbsp;#NumberFormat(totOpp, "9,999.0")#</b></font></td>
+    </tr>
+    <cfif Formula.RecordCount GT 25>
+    <tr>
+        <td height="22" bgcolor="##cccccc" valign="bottom" align="center" colspan="14" style="vertical-align: bottom;">
+            <a href="avar_select.cfm" title="Return to Variance Selection Page"><img src="/images/avar_return.gif" width="94" height="15" border="0" alt=""></a>
+            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+            <a href="avar_#thisApp#_exec2xl.cfm#exportParms#" title="Download City Delivery Variance Summary to Excel"><img src="/images/avar_send2excel.gif" width="80" height="15" alt="Download City Delivery Variance Summary to Excel" border="0"></a>
+        </td>
+    </tr>
+    </cfif>
+    </cfoutput>
+    <tr>
+    </table>
+    <table cellpadding="0" width="100%" cellspacing="0" class="generique style-alternative" style="font-size:11px">
+        <cfoutput>
+        <thead>
+        <tr>
+        <th class="sortable" align="center" width="250" valign="bottom">Delivery Unit Name</th>
+        <th class="sortable" align="center" width="100" valign="bottom">Percent to Minimum Standard Target: #PCTS.pctSTND#%</th>
+        <!---
+        <th class="sortable" align="center" width="100" valign="bottom">OEI Pct to SPLY</th>
+        <th class="sortable" align="center" width="100" valign="bottom">SEI Pct to SPLY</th>
+        --->
+        <th class="sortable" align="center" width="100" valign="bottom">DPH Pct to SPLY </th>
+        <th class="sortable" align="center" width="100" valign="bottom">DPS Letter Pct. Target: #PCTS.dpsPCT#%</th>
+        <th class="sortable" align="center" width="100" valign="bottom">DPS Flat Pct. Target: #PCTS.fssPCT#%</th>
+        <th class="sortable" align="center" width="100" valign="bottom">Cased Vol Pct.</th>
+        <th class="sortable" align="center" width="100" valign="bottom">Actual CSR (Earned 1.34)</th>
+        <th class="sortable" align="center" width="100" valign="bottom">Percent Overtime</th>
+        <th class="sortable" align="center" width="100" valign="bottom">CDPOM Opp. Target: <=0</th>
+        <th class="sortable" align="center" width="100" valign="bottom">&nbsp;&nbsp;Daily&nbsp;&nbsp; Office Opp. Target: <=0</th>
+        <th class="sortable" align="center" width="100" valign="bottom">&nbsp;&nbsp;Daily&nbsp;&nbsp; Street Opp. Target: <=0</th>
+        <th class="sortable" align="center" width="100" valign="bottom">&nbsp;&nbsp;Daily&nbsp;&nbsp; Other Opp. Target: <=0</th>
+        <th class="sortable" align="center" width="100" valign="bottom">Daily FTER Total Opp. Target: <=0</th>
+        <th class="sortable" align="center" width="100" valign="bottom">Percent Achieved</th>
+        </tr>
+        </thead>
+        </cfoutput>
+        <tbody>
+        <cfoutput query="formula">
+		
+		
+		<!-- 2024-1-24 Added new condition to hide certain data - Tim Tran -->
+		<cfif (scope NEQ "nata" && scope NEQ "natc") || (find("4", #b_area#) GT 0 )>
+		
+            <tr>
+                <td valign="bottom" nowrap style="text-align: right; padding-right: 3px;">
+                    <cfif scope EQ "nata">
+                        <a href="#thisTemplate#?scope=area&beginPeriod=#beginPeriod#&endPeriod=#endPeriod#&area=#b_area#&unit=nata" title="Link to Variance Report for #b_area_name#">(#b_area#) #b_area_name#</a>
+                    <cfelseif scope EQ "natc">
+                        <a href="#thisTemplate#?scope=cluster&beginPeriod=#beginPeriod#&endPeriod=#endPeriod#&cluster=#b_cluster#&unit=natc" title="Link to Variance Report for #b_cluster_name#">(#b_area#) #b_cluster_name#</a>
+                    <cfelse>
+                        <a href="avar_#thisApp#1.cfm#urlParms#&unit=#b_fin_nbr#" title="Link to #b_fin_name# Unit Variance Report">#b_fin_name#</a>
+                        <cfif b_rto_ind EQ 1><span style="font-size: 9px;" title="Unit is an RTI">(RTO)</span></cfif>
+                        <cfif b_fss_ind EQ 1 AND b_dps_ind EQ 1><span style="font-size: 9px;" title="Unit has Both City DPS Flats and Letters">(B)</span>
+                        <cfelseif b_fss_ind EQ 1 AND b_dps_ind EQ 0><span style="font-size: 9px;" title="Unit has City DPS Flats">(F)</span>
+                        <cfelseif b_fss_ind EQ 0 AND b_dps_ind EQ 1><span style="font-size: 9px;" title="Unit has City DPS Letters">(L)</span>
+                        <cfelse><span style="font-size: 9px;" title="Unit has no City DPS Flats or Letters">(N)</span>
+                        </cfif>
+                    </cfif>
+                    <!--- <cfif qryRTO.b_rto_ind EQ 1><span style="font-size: 9px;" title="Unit is an RTO Site.">&nbsp;(RTO)</span></cfif> --->
+                </td>
+                <cfif TotWebCoinsCarriers EQ '' || w_cty_rte EQ '' || w_cty_rte EQ 0>
+                    <cfset actualCSR = 0 />
+                <cfelse>
+                    <cfset actualCSR = TotWebCoinsCarriers/w_cty_rte />
+                </cfif>
+                <td align="center" width="100">#NumberFormat(act_pct_standard*100, '9')#</td>
+                <!---
+                <td align="center" width="100">#decimalFormat(oei2sply*100)#</td>
+                <td align="center" width="100">#decimalFormat(sei2sply*100)#</td>
+                --->
+                <td align="center" width="100">#decimalFormat(dph2sply*100)#</td>
+                <td align="center" width="100">#NumberFormat(dps_pct*100, '9')#</td>
+                <td align="center" width="100">#NumberFormat(fss_pct*100, '9')#</td>
+                <td align="center" width="100">#NumberFormat(ManVolPct*100, '9')#</td>
+                <td align="center" width="100">#decimalformat(actualCSR)#</td>
+                <td align="center" width="100">#decimalFormat(ot_pct*100)#</td>
+                <td align="center" width="100">#decimalFormat(dly_fters_opp)#</td>
+                <td align="center" width="100">#decimalFormat(dly_ofc_opp)#</td>
+                <td align="center" width="100">#decimalFormat(dly_str_opp)#</td>
+                <td align="center" width="100">#decimalFormat(dly_oth_opp)#</td>
+                <td align="center" width="100">#decimalFormat(dly_tot_opp)#</td>
+                <td align="center" width="100">#decimalFormat(tot_pct_ach*100)#</td>
+            </tr>
+			
+		</cfif>	
+			
+			
+			
+        </cfoutput>
+        </tbody>
+    <tr> <!--- MUST BE BELOW THE TBODY CLOSE OR IT WILL BE INCLUDED IN THE SORT RESULTS --->
+        <cfoutput>
+        <td height="22" bgcolor="##cccccc" valign="bottom" align="center" colspan="14" style="vertical-align: bottom;">
+            <a href="avar_select.cfm" title="Return to Variance Selection Page"><img src="/images/avar_return.gif" width="94" height="15" border="0" alt=""></a>
+            &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+            <a href="avar_#thisApp#_exec2xl.cfm#exportParms#" title="Download City Deliver Variance Summary to Excel"><img src="/images/avar_send2excel.gif" width="80" height="15" alt="Download City Delivery Variance Summary to Excel" border="0"></a>
+        </td>
+        </cfoutput>
+    </tr>
+</table>
+</div>
+<cfcatch type="any">
+    <cfoutput>#cfcatch.detail#</cfoutput>
+</cfcatch>
+</cftry>
+</body>
+</html>
 
 
 <!DOCTYPE html>
