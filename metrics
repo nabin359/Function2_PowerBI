@@ -27,6 +27,10 @@ where:
 
 
 
+Sum of all base (planned) Function-2B hours across Office (LDC21/26/29), Street (LDC22) and Other (LDC23+27). Each basXX is the unit’s base hours-per-day from var_base multiplied by the total delivery days (SUM(w_del_days)) in the selected FY/WK window.
+
+
+
 
 tot_a2b_hrs = tot_aofc_hrs + act22 + tot_aother_hrs
 where:
@@ -41,6 +45,10 @@ where:
 
 
 
+Sum of actual observed Function-2B hours from weekly actual hours (var_weekly) across office, street and other LDCs for the window.
+
+
+
 tot_var2b_hrs = tot_ofc_var_hrs + ldc22_var_hrs + tot_var_other_hrs
 where (from the query/CFML):
   tot_ofc_var_hrs  ≈ rt_pivot_perf_dly_act  -- implemented in SELECT as:
@@ -50,3 +58,12 @@ where (from the query/CFML):
           * prod_fters_fact )
   ldc22_var_hrs = act22 - ern22
   tot_var_other_hrs = tot_aother_hrs - tot_eother_hrs
+
+
+ggregate opportunity/variance across Function-2B:
+
+tot_ofc_var_hrs is the office pivot/variance computed by subtracting the actual-derived route-hour equivalent (normalized by delivery days, converted to FTER and scaled by prod_fters_fact) from the baseline total hours (getBase.BaseHours).
+
+ldc22_var_hrs is the street (LDC22) actual minus earned.
+
+tot_var_other_hrs is the Other hours actual minus earned (23+27).
