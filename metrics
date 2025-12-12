@@ -8,3 +8,45 @@ where:
   tot_eother_hrs = ern23 + ern27
   ern23 = SUM(cd_ern_hrs_ldc23)
   ern27 = SUM(cd_ern_hrs_ldc27)
+
+
+
+
+
+
+tot_b2b_hrs = tot_bofc_hrs + bas22 + tot_bother_hrs
+where:
+  tot_bofc_hrs = bas21 + bas26 + bas29
+  bas21 = b_hrs_ldc21 * SUM(w_del_days)
+  bas26 = b_hrs_ldc26 * SUM(w_del_days)
+  bas29 = b_hrs_ldc29 * SUM(w_del_days)
+  bas22 = b_hrs_ldc22 * SUM(w_del_days)
+  tot_bother_hrs = bas23 + bas27
+  bas23 = b_oth_23 * SUM(w_del_days)
+  bas27 = b_oth_27 * SUM(w_del_days)
+
+
+
+
+tot_a2b_hrs = tot_aofc_hrs + act22 + tot_aother_hrs
+where:
+  tot_aofc_hrs = act21 + act26 + act29
+  act21 = SUM(w_hrs_ldc21)
+  act26 = SUM(w_hrs_ldc26)
+  act29 = SUM(w_hrs_ldc29)
+  act22 = SUM(w_hrs_ldc22)
+  tot_aother_hrs = act23 + act27
+  act23 = SUM(w_hrs_ldc23)
+  act27 = SUM(w_hrs_ldc27)
+
+
+
+tot_var2b_hrs = tot_ofc_var_hrs + ldc22_var_hrs + tot_var_other_hrs
+where (from the query/CFML):
+  tot_ofc_var_hrs  ≈ rt_pivot_perf_dly_act  -- implemented in SELECT as:
+    rt_pivot_perf_dly_act =
+      (getBase.BaseHours)
+      - ( ( (CAST(SUM(w_hrs_ldc21 + w_hrs_ldc22 + w_hrs_ldc26 + w_hrs_ldc29) AS DECIMAL(18,2)) / SUM(w_del_days)) / 8 )
+          * prod_fters_fact )
+  ldc22_var_hrs = act22 - ern22
+  tot_var_other_hrs = tot_aother_hrs - tot_eother_hrs
