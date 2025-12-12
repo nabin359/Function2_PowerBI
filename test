@@ -170,3 +170,258 @@
     </script>
 </body>
 </html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pivot Opportunity — Modern Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Tailwind CDN (for quick demo) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- DataTables and Buttons for export -->
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css" />
+  <link rel="stylesheet" href="https://cdn.datatables.net/buttons/2.4.1/css/buttons.dataTables.min.css" />
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.1/js/dataTables.buttons.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdn.datatables.net/buttons/2.4.1/js/buttons.html5.min.js"></script>
+
+  <style>
+    /* small tweak to make KPI numbers stand out */
+    .kpi-num { font-size: 1.6rem; font-weight: 700; }
+    .kpi-label { font-size: 0.85rem; color: #374151; }
+    .pct-cell { color: white; font-weight: 700; padding: 0.25rem 0.5rem; border-radius: 4px; display:inline-block; min-width:64px; text-align:center;}
+  </style>
+</head>
+<body class="bg-slate-50 font-sans">
+
+  <div class="max-w-7xl mx-auto p-4">
+    <!-- Header / Bread -->
+    <div class="mb-4">
+      <a class="text-sky-700 underline" href="avar_pivot.cfm">Return to Range Selection</a>
+      <h1 class="text-2xl font-semibold mt-2">City Delivery Pivot Opportunity — Modern View</h1>
+      <p class="text-sm text-slate-600">Same metrics and queries — modern presentation</p>
+    </div>
+
+    <!-- KPIs -->
+    <div class="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+      <!-- KPI cards will be built by JS -->
+      <div id="kpis" class="col-span-6 grid grid-cols-2 gap-3"></div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+      <div class="lg:col-span-2 bg-white shadow rounded p-4">
+        <canvas id="barTop10" height="160"></canvas>
+      </div>
+      <div class="bg-white shadow rounded p-4">
+        <canvas id="pctDonut" height="160"></canvas>
+      </div>
+    </div>
+
+    <!-- Data table -->
+    <div class="bg-white shadow rounded p-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold">Area / Unit Pivot Summary</h2>
+        <div>
+          <button id="refreshBtn" class="px-3 py-1 bg-sky-600 text-white rounded">Refresh</button>
+        </div>
+      </div>
+
+      <table id="pivotTable" class="stripe hover w-full" style="width:100%">
+        <thead>
+          <tr>
+            <th>Chart</th>
+            <th>Area</th>
+            <th>Area Name</th>
+            <th>Base Routes</th>
+            <th>Earned Workload</th>
+            <th>Actual Workhours</th>
+            <th>Daily Pivot Opp</th>
+            <th>Pivot Perf Actual</th>
+            <th>% Achieved</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+
+    </div>
+  </div>
+
+<script>
+/*
+  Expected REST responses (examples)
+  GET /api/pivot/summary  => { base_sum, earned_sum, actual_sum, daily_pivot_sum, pivot_perf_sum, pct_ach_avg }
+  GET /api/pivot/list     => [ { areaCode, areaName, baseRoutes, earnedWorkload, actualWorkhours, dailyPivotOpp, pivotPerfActual, pctAchieved } ... ]
+  For demo, this script uses a small static example. Replace fetch mocks with real fetch() calls to your new endpoints.
+*/
+
+async function fetchSummary() {
+  // Replace this with: return fetch('/api/pivot/summary').then(r=>r.json());
+  return {
+    base_sum: 138753.81,
+    earned_sum: 124417.81,
+    actual_sum: 133007.89,
+    daily_pivot_sum: 14336,
+    pivot_perf_sum: 5745.92,
+    pct_ach_avg: 0.4008
+  };
+}
+
+async function fetchList() {
+  // Replace this with: return fetch('/api/pivot/list').then(r=>r.json());
+  // Minimal demo dataset
+  return [
+    { areaCode: '4J', areaName: 'CENTRAL RETAIL & DELI', baseRoutes: 34202.01, earnedWorkload:30066.19, actualWorkhours:33004.93, dailyPivotOpp:4135.83, pivotPerfActual:1197.08, pctAchieved:0.2894 },
+    { areaCode: '4B', areaName: 'ATLANTIC RETAIL & DEL', baseRoutes:40706.20, earnedWorkload:36362.57, actualWorkhours:38734.22, dailyPivotOpp:4343.63, pivotPerfActual:1971.98, pctAchieved:0.4540 },
+    // ... load more rows here
+  ];
+}
+
+function formatNumber(v) {
+  if (v === null || v === undefined) return '-';
+  return Intl.NumberFormat().format(Math.round(v*100)/100);
+}
+
+function pctColor(p) {
+  // p in 0..1
+  if (p >= 0.95) return 'bg-sky-700';    // blue for perfect
+  if (p >= 0.85) return 'bg-emerald-600'; // green
+  if (p >= 0.75) return 'bg-amber-400';   // yellow
+  return 'bg-rose-500';                   // red
+}
+
+async function renderDashboard() {
+  const summary = await fetchSummary();
+  const list = await fetchList();
+
+  // Render KPI cards
+  const kpiRoot = document.getElementById('kpis');
+  kpiRoot.innerHTML = '';
+  const kpis = [
+    { label: 'Base number of Equivalent City Routes', value: summary.base_sum },
+    { label: 'Earned Rts Equivalent Workload', value: summary.earned_sum },
+    { label: 'Actual Rts Equivalent Workhours', value: summary.actual_sum },
+    { label: 'Daily Pivot Opportunity', value: summary.daily_pivot_sum },
+    { label: 'Rts Pivot Performance Actual', value: summary.pivot_perf_sum },
+    { label: 'Pivot Opportunity % Achieved', value: (summary.pct_ach_avg*100) }
+  ];
+  kpis.forEach(k=>{
+    const el = document.createElement('div');
+    el.className = 'bg-white shadow rounded p-3 flex flex-col';
+    el.innerHTML = `<div class="kpi-num">${k.label.includes('%') ? k.value.toFixed(2) + '%' : formatNumber(k.value)}</div>
+                    <div class="kpi-label">${k.label}</div>`;
+    kpiRoot.appendChild(el);
+  });
+
+  // Build datatable rows
+  const tbody = document.querySelector('#pivotTable tbody');
+  tbody.innerHTML = '';
+  list.forEach(r=>{
+    const pct = Math.round((r.pctAchieved||0)*10000)/100;
+    // conditional class
+    const pctClass = pctColor(r.pctAchieved||0);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><a href="pivot/pivot_main.cfm?area_no=${encodeURIComponent(r.areaCode)}" target="_blank" class="text-sky-600">🔍</a></td>
+                    <td>${r.areaCode||''}</td>
+                    <td class="text-left">${r.areaName||''}</td>
+                    <td class="text-right">${formatNumber(r.baseRoutes)}</td>
+                    <td class="text-right">${formatNumber(r.earnedWorkload)}</td>
+                    <td class="text-right">${formatNumber(r.actualWorkhours)}</td>
+                    <td class="text-right">${formatNumber(r.dailyPivotOpp)}</td>
+                    <td class="text-right">${formatNumber(r.pivotPerfActual)}</td>
+                    <td class="text-center"><span class="pct-cell ${pctClass}">${pct}%</span></td>`;
+    tbody.appendChild(tr);
+  });
+
+  // Initialize DataTable (Buttons for Excel export)
+  $('#pivotTable').DataTable( {
+    destroy: true,
+    dom: 'Bfrtip',
+    buttons: [
+      {
+        extend: 'excelHtml5',
+        title: 'Pivot_Opportunity_export'
+      }
+    ],
+    pageLength: 25
+  });
+
+  // Charts
+  // Top 10 daily pivot
+  const top10 = list.slice().sort((a,b)=>b.dailyPivotOpp - a.dailyPivotOpp).slice(0,10);
+  const ctx = document.getElementById('barTop10').getContext('2d');
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: top10.map(d=>d.areaCode+' '+d.areaName),
+      datasets: [{
+        label: 'Daily Pivot Opportunity',
+        data: top10.map(d=>d.dailyPivotOpp),
+        borderWidth: 1
+      }]
+    },
+    options: {
+      plugins: { legend: { display:false } },
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { autoSkip: false } },
+        y: { beginAtZero:true }
+      },
+      onClick: (e, items) => {
+        if (items.length) {
+          const i = items[0].index;
+          const area = top10[i];
+          // open drill link
+          window.open(`avar_pivot2.cfm?viewLevel=C&b_area=${encodeURIComponent(area.areaCode)}`, '_blank');
+        }
+      }
+    }
+  });
+
+  // Donut: % achieved overall
+  const pctCtx = document.getElementById('pctDonut').getContext('2d');
+  new Chart(pctCtx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Captured','Remaining'],
+      datasets: [{
+        data: [summary.pct_ach_avg*100, (1-summary.pct_ach_avg)*100],
+        borderWidth: 1
+      }]
+    },
+    options: {
+      plugins: { legend:{ position: 'bottom' } },
+      maintainAspectRatio:false,
+      cutout: '70%'
+    }
+  });
+}
+
+document.getElementById('refreshBtn').addEventListener('click', renderDashboard);
+renderDashboard();
+
+</script>
+</body>
+</html>
