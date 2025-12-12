@@ -1,1 +1,10 @@
 
+tot_e2b_hrs = tot_eofc_hrs + ern22 + tot_eother_hrs
+where:
+  tot_eofc_hrs = ern21 + ern26
+  ern21 = SUM(cd_ern_hrs_ldc21)
+  ern26 = SUM(cd_ern_hrs_ldc26)
+  ern22 = SUM(cd_ern_hrs_ldc22)
+  tot_eother_hrs = ern23 + ern27
+  ern23 = SUM(cd_ern_hrs_ldc23)
+  ern27 = SUM(cd_ern_hrs_ldc27)
