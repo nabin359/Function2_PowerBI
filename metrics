@@ -1,3 +1,56 @@
+--Base Total Manual Volume
+
+CASE 
+  WHEN (b_am_cas_ltr_pcs + b_pm_cas_ltr_pcs
+      + b_am_cas_flt_pcs + b_pm_cas_flt_pcs
+      + b_vol_dps_pcs + b_vol_fss_pcs) = 0
+  THEN 0
+  ELSE
+    (b_am_cas_ltr_pcs + b_pm_cas_ltr_pcs
+   + b_am_cas_flt_pcs + b_pm_cas_flt_pcs)
+    / CAST(
+        (b_am_cas_ltr_pcs + b_pm_cas_ltr_pcs
+       + b_am_cas_flt_pcs + b_pm_cas_flt_pcs
+       + b_vol_dps_pcs + b_vol_fss_pcs) 
+      AS DECIMAL(18,2)
+      )
+END AS bManVolPct
+
+
+
+--Actual Total Manual Volume PCT
+
+CASE 
+  WHEN SUM(w_vol_dps_ltr + w_vol_dps_flt + w_vol_cas_flt + w_vol_cas_ltr) = 0
+  THEN 0
+  ELSE
+    SUM(w_vol_cas_flt + w_vol_cas_ltr)
+    / CAST(
+        SUM(w_vol_dps_ltr + w_vol_dps_flt + w_vol_cas_flt + w_vol_cas_ltr)
+      AS DECIMAL(18,2)
+      )
+END AS aManVolPct
+
+
+
+#Variance B
+
+Variance/B (percentage points) = (ActualPct − BasePct) × 100
+
+
+# Percentage variance B
+
+% Variance/B = ((ActualPct − BasePct) / BasePct) × 100
+
+
+
+
+
+
+
+
+
+
 
 tot_e2b_hrs = tot_eofc_hrs + ern22 + tot_eother_hrs
 where:
