@@ -1,3 +1,84 @@
+WITH base_data AS (
+    SELECT
+          b.b_area_name,
+          b.b_cluster_name,
+          b.b_lead_fin_nbr,
+          b.b_lead_name,
+          b.b_fin_nbr,
+          b.b_fin_name,
+          b.b_mpoo,
+          b.b_pce_ind,
+          w.w_fy,
+
+          -- Delivered Volume (letters + flats + DPS + sequenced)
+          CAST(w.w_vol_cas_ltr AS BIGINT)
+        + CAST(w.w_vol_cas_flt AS BIGINT)
+        + CAST(w.w_vol_dps_ltr AS BIGINT)
+        + CAST(w.w_vol_dps_flt AS BIGINT)
+        + CAST(w.w_vol_seq_pcs AS BIGINT) AS delivered_volume,
+
+          -- PKCC
+          CAST(w.w_vol_pkcc AS BIGINT) AS pkcc_volume
+
+    FROM [PCDV_DW].[dbo].[var_weekly] w
+    JOIN [PCDV_DW].[dbo].[var_base] b
+          ON w.w_fin_nbr = b.b_fin_nbr
+    WHERE 
+          b.b_level >= 21
+          AND b.b_cdv_ind = 1
+		  and b_mpoo <> 'Z'
+          AND w.w_fy BETWEEN 2021 AND 2025
+)
+
+SELECT
+      b_area_name,
+      b_cluster_name,
+      b_lead_fin_nbr,
+      b_lead_name,
+      b_fin_nbr,
+      b_fin_name,
+      b_mpoo,
+      b_pce_ind,
+
+      -- Delivered Volume by FY
+      SUM(CASE WHEN w_fy = 2021 THEN delivered_volume END) AS Delivered_2021,
+      SUM(CASE WHEN w_fy = 2022 THEN delivered_volume END) AS Delivered_2022,
+      SUM(CASE WHEN w_fy = 2023 THEN delivered_volume END) AS Delivered_2023,
+      SUM(CASE WHEN w_fy = 2024 THEN delivered_volume END) AS Delivered_2024,
+      SUM(CASE WHEN w_fy = 2025 THEN delivered_volume END) AS Delivered_2025,
+
+      -- PKCC by FY
+      SUM(CASE WHEN w_fy = 2021 THEN pkcc_volume END) AS PKCC_2021,
+      SUM(CASE WHEN w_fy = 2022 THEN pkcc_volume END) AS PKCC_2022,
+      SUM(CASE WHEN w_fy = 2023 THEN pkcc_volume END) AS PKCC_2023,
+      SUM(CASE WHEN w_fy = 2024 THEN pkcc_volume END) AS PKCC_2024,
+      SUM(CASE WHEN w_fy = 2025 THEN pkcc_volume END) AS PKCC_2025
+
+FROM base_data
+GROUP BY
+      b_area_name,
+      b_cluster_name,
+      b_lead_fin_nbr,
+      b_lead_name,
+      b_fin_nbr,
+      b_fin_name,
+      b_mpoo,
+      b_pce_ind
+
+ORDER BY
+      b_area_name,
+      b_cluster_name,
+      b_fin_nbr;
+
+
+
+
+
+
+
+
+
+
 <!--- If not from the select page or mothership app then redirect --->
 <cfif !IsDefined("FORM.rpt_type") && !IsDefined("URL.scope")>
     <cflocation url="avar_select.cfm" addtoken="false" />
