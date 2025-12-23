@@ -1,5 +1,28 @@
+---Natinal everything all together
 
----Good query for national volumn
+SELECT
+      w_fy,
+
+      -- Total volume (safe from overflow)
+      SUM(
+            CAST(w_vol_cas_flt AS BIGINT)
+          + CAST(w_vol_cas_ltr AS BIGINT)
+          + CAST(w_vol_dps_ltr AS BIGINT)
+          + CAST(w_vol_dps_flt AS BIGINT)
+          + CAST(w_vol_seq_pcs AS BIGINT)
+      ) AS total_volume,
+
+      -- PKCC separate (also cast to avoid overflow)
+      SUM(CAST(w_vol_pkcc AS BIGINT)) AS pkcc_volume
+
+FROM [PCDV_DW].[dbo].[var_weekly]
+WHERE w_fy BETWEEN 2021 AND 2025
+GROUP BY w_fy
+ORDER BY w_fy;
+
+
+
+---Good query for national volume level 21 and above
 
 WITH base_data AS (
     SELECT
