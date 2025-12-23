@@ -1,3 +1,48 @@
+    CASE
+        WHEN SUM(CAST(w.w_del_days AS DECIMAL(30,2))) = 0 THEN 0
+        WHEN SUM(CAST(w.w_hrs_ldc21 + w.w_hrs_ldc26 + w.w_hrs_ldc29
+                     + w.w_hrs_ldc22
+                     + w.w_hrs_ldc23 + w.w_hrs_ldc27 AS DECIMAL(30,2))) = 0
+        THEN 0
+        ELSE
+            /* Office Opp (FTER) */
+            (
+                (
+                    SUM(CAST(w.w_hrs_ldc21 + w.w_hrs_ldc26 + w.w_hrs_ldc29 AS DECIMAL(30,2)))
+                  - SUM(CAST(calc.cd_ern_hrs_ldc21 + calc.cd_ern_hrs_ldc26 AS DECIMAL(30,2)))
+                )
+                / NULLIF(SUM(CAST(w.w_del_days AS DECIMAL(30,2))), 0)
+            ) / 8.0
+
+            +
+
+            /* Street Opp (FTER) */
+            (
+                (
+                    SUM(CAST(w.w_hrs_ldc22 AS DECIMAL(30,2)))
+                  - SUM(CAST(calc.cd_ern_hrs_ldc22 AS DECIMAL(30,2)))
+                )
+                / NULLIF(SUM(CAST(w.w_del_days AS DECIMAL(30,2))), 0)
+            ) / 8.0
+
+            +
+
+            /* Other Opp (FTER) */
+            (
+                (
+                    SUM(CAST(w.w_hrs_ldc23 + w.w_hrs_ldc27 AS DECIMAL(30,2)))
+                  - ISNULL(SUM(CAST(calc.cd_ern_hrs_ldc23 + calc.cd_ern_hrs_ldc27 AS DECIMAL(30,2))), 0)
+                )
+                / NULLIF(SUM(CAST(w.w_del_days AS DECIMAL(30,2))), 0)
+            ) / 8.0
+    END AS dly_tot_opp,
+
+
+
+
+
+
+
 
 /* Set your FYWK range */
 DECLARE @begFYWk INT = 202501;   -- YYYYWW (example)
