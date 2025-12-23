@@ -1,3 +1,128 @@
+
+
+---with only two percentage column
+
+WITH base_data AS (
+    SELECT
+          b.b_area,
+          b.b_area_name,
+          b.b_cluster_name,
+          b.b_lead_fin_nbr,
+          b.b_lead_name,
+          b.b_fin_nbr,
+          b.b_fin_name,
+          b.b_level,
+          b.b_mpoo,
+          b.b_pce_ind,
+          w.w_fy,
+
+          -- Delivered Volume (letters + flats + DPS + sequenced)
+          CAST(w.w_vol_cas_ltr AS BIGINT)
+        + CAST(w.w_vol_cas_flt AS BIGINT)
+        + CAST(w.w_vol_dps_ltr AS BIGINT)
+        + CAST(w.w_vol_dps_flt AS BIGINT)
+        + CAST(w.w_vol_seq_pcs AS BIGINT) AS delivered_volume,
+
+          -- PKCC
+          CAST(w.w_vol_pkcc AS BIGINT) AS pkcc_volume
+
+    FROM [PCDV_DW].[dbo].[var_weekly] w
+    JOIN [PCDV_DW].[dbo].[var_base] b
+          ON w.w_fin_nbr = b.b_fin_nbr
+    WHERE 
+          b.b_level >= 21
+          AND b.b_cdv_ind = 1
+          AND b.b_mpoo <> 'Z'
+          AND b.b_area NOT IN ('1A','1C', '1F', '1M')
+          AND w.w_fy BETWEEN 2021 AND 2025
+)
+
+SELECT
+      b_area AS Area,
+      b_area_name AS Area_Name,
+      b_cluster_name AS District,
+      b_lead_fin_nbr AS Lead_Finance_Number,
+      b_lead_name AS Lead_Finance_Name,
+      b_fin_nbr AS Finance_Number,
+      b_fin_name AS Finance_Name,
+      b_level AS Level,
+      b_mpoo AS MPOO,
+      b_pce_ind AS PCES_Identifier,
+
+      -- Delivered Volume by FY
+      SUM(CASE WHEN w_fy = 2021 THEN delivered_volume END) AS Delivered_2021,
+      SUM(CASE WHEN w_fy = 2022 THEN delivered_volume END) AS Delivered_2022,
+      SUM(CASE WHEN w_fy = 2023 THEN delivered_volume END) AS Delivered_2023,
+      SUM(CASE WHEN w_fy = 2024 THEN delivered_volume END) AS Delivered_2024,
+      SUM(CASE WHEN w_fy = 2025 THEN delivered_volume END) AS Delivered_2025,
+
+      -- PKCC by FY
+      SUM(CASE WHEN w_fy = 2021 THEN pkcc_volume END) AS PKCC_2021,
+      SUM(CASE WHEN w_fy = 2022 THEN pkcc_volume END) AS PKCC_2022,
+      SUM(CASE WHEN w_fy = 2023 THEN pkcc_volume END) AS PKCC_2023,
+      SUM(CASE WHEN w_fy = 2024 THEN pkcc_volume END) AS PKCC_2024,
+      SUM(CASE WHEN w_fy = 2025 THEN pkcc_volume END) AS PKCC_2025,
+
+      ---------------------------------------------------------
+      -- TOTAL % CHANGE 2021 → 2025 (DELIVERED)
+      ---------------------------------------------------------
+      FORMAT(
+          ROUND(
+              CASE 
+                  WHEN SUM(CASE WHEN w_fy = 2021 THEN delivered_volume END) = 0 THEN NULL
+                  ELSE (
+                      (SUM(CASE WHEN w_fy = 2025 THEN delivered_volume END)
+                     - SUM(CASE WHEN w_fy = 2021 THEN delivered_volume END))
+                      * 100.0
+                      / SUM(CASE WHEN w_fy = 2021 THEN delivered_volume END)
+                  )
+              END
+          , 2),
+          '#0.##'
+      ) AS Delivered_Pct_Change_21_to_25,
+
+      ---------------------------------------------------------
+      -- TOTAL % CHANGE 2021 → 2025 (PKCC)
+      ---------------------------------------------------------
+      FORMAT(
+          ROUND(
+              CASE 
+                  WHEN SUM(CASE WHEN w_fy = 2021 THEN pkcc_volume END) = 0 THEN NULL
+                  ELSE (
+                      (SUM(CASE WHEN w_fy = 2025 THEN pkcc_volume END)
+                     - SUM(CASE WHEN w_fy = 2021 THEN pkcc_volume END))
+                      * 100.0
+                      / SUM(CASE WHEN w_fy = 2021 THEN pkcc_volume END)
+                  )
+              END
+          , 2),
+          '#0.##'
+      ) AS PKCC_Pct_Change_21_to_25
+
+FROM base_data
+GROUP BY
+      b_area,
+      b_area_name,
+      b_cluster_name,
+      b_lead_fin_nbr,
+      b_lead_name,
+      b_fin_nbr,
+      b_fin_name,
+      b_level,
+      b_mpoo,
+      b_pce_ind
+
+ORDER BY
+      b_area_name,
+      b_cluster_name,
+      b_fin_nbr;
+
+
+
+
+
+
+
 ---National everything all together
 
 SELECT
