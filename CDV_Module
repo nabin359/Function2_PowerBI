@@ -2,8 +2,6 @@
 
 
 
-
-
 /* ============================================================
    CDV Executive Summary / Table Query (SQL Server runnable)
    - Replace @sqlWhere with your desired filter logic
@@ -222,8 +220,8 @@ JOIN [PCDV_DW].dbo.var_annual ann WITH (NOLOCK)                   ON 1 = 1
 
 WHERE
     b.b_cdv_ind = 1
-	/* AND b.b_level = 26 */
-	AND b.b_area = '4B'
+	AND b.b_level = 26
+	--AND b.b_area = '4B'
 	AND b.b_mpoo <> 'X'
     AND ((calc.calc_fy * 100) + calc.calc_wk) BETWEEN @begFYWk AND @endFYWk
 
