@@ -301,3 +301,98 @@ label {
 </cftry>
 </body>
 </html>
+
+
+
+
+
+
+ SELECT b_area, b_area_name,
+            CASE WHEN SUM(CAST(b_sei_ldc22 AS DECIMAL(30,2)))=0 THEN 0 ELSE SUM(CAST(b_sei_del AS DECIMAL(30,2))) / SUM(CAST(b_sei_ldc22 AS DECIMAL(30,2))) END AS B_SEI_PREV_YR,
+
+                CASE WHEN SUM(CAST(w_hrs_ldc21+w_hrs_ldc29 AS DECIMAL(30,2)))=0 OR SUM(CAST(w_vol_cas_ltr AS DECIMAL(30,2)))=0 OR SUM(CAST(w_vol_cas_flt AS DECIMAL(30,2)))=0
+                THEN
+                    0
+                    ELSE (SUM(CAST(w_hrs_ldc21+w_hrs_ldc29 AS DECIMAL(30,2))))/ (((((SUM(CAST(w_vol_cas_ltr AS DECIMAL(30,2))) /18)+(SUM(CAST(w_vol_cas_flt AS DECIMAL(30,2)))/8)+ ((SUM(CAST(w_vol_cas_ltr AS DECIMAL(30,2)))+SUM(CAST(w_vol_cas_flt AS DECIMAL(30,2))))/70))/60)) +(sum(CAST(b_hrs_fot_w_brk * w_del_days AS DECIMAL(30,2))) ))
+                END act_pct_standard,
+
+                CASE WHEN SUM(CAST(w_hrs_ldc21 as decimal(30,2))+ CAST(w_hrs_ldc22 as decimal(30,2))+ CAST(w_hrs_ldc23 as decimal(30,2)) + CAST(w_hrs_ldc26 as decimal(30,2))+ CAST(w_hrs_ldc27 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2)))=0 THEN 0
+                    ELSE (SUM(CAST(cd_ern_hrs_ldc21 AS DECIMAL(30,2))) +SUM(CAST(cd_ern_hrs_ldc22 AS DECIMAL(30,2))) +SUM(CAST(cd_ern_hrs_ldc23 AS DECIMAL(30,2))) +SUM(CAST(cd_ern_hrs_ldc26 AS DECIMAL(30,2))) +SUM(CAST(cd_ern_hrs_ldc27 AS DECIMAL(30,2))) +SUM(CAST(cd_ern_hrs_ldc29 AS DECIMAL(30,2))))/
+                            SUM(CAST(w_hrs_ldc21 as decimal(30,2))+ CAST(w_hrs_ldc22 as decimal(30,2))+ CAST(w_hrs_ldc23 as decimal(30,2)) + CAST(w_hrs_ldc26 as decimal(30,2))+ CAST(w_hrs_ldc27 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2)))
+                END  tot_pct_ach,
+
+                CASE WHEN SUM(CAST(cd_ern_hrs_ldc21 AS DECIMAL(30,2)))=0 OR SUM(CAST(w_cty_cupd AS DECIMAL(30,2)))=0 OR SUM(CAST(w_hrs_ldc21 AS DECIMAL(30,2)) + CAST(w_hrs_ldc29 AS DECIMAL(30,2)))=0 THEN 0
+                       ELSE (SUM(CAST(w_cty_cupd as decimal(30,2)))/SUM(CAST(w_hrs_ldc21 AS DECIMAL(30,2))+ CAST(w_hrs_ldc29 AS DECIMAL(30,2))))-(SUM(CAST(w_cty_cupd AS DECIMAL(30,2)))/SUM(CAST(w_hrs_ldc21 AS DECIMAL(30,2))+ CAST(w_hrs_ldc29 AS DECIMAL(30,2)))) END oei_var2earned,
+
+                CASE WHEN
+                    SUM(CAST(w_sply_dels as decimal(30,2))) =0 OR SUM(CAST(w_sply_hrs as decimal(30,2))) = 0 OR SUM(CAST(w_hrs_ldc21 as decimal(30,2)) + CAST(w_hrs_ldc22 as decimal(30,2)) + CAST(w_hrs_ldc23 as decimal(30,2)) + CAST(w_hrs_ldc24 as decimal(30,2)) + CAST(w_hrs_ldc26 as decimal(30,2)) + CAST(w_hrs_ldc27 as decimal(30,2)) + CAST(w_hrs_ldc28 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2)) + CAST(w_hrs_ldc92 as decimal(30,2))) = 0
+                THEN
+                    0
+                ELSE
+                    CASE WHEN
+                        SUM(CAST(w_sply_dels as decimal(30,2)))/SUM(CAST(w_sply_hrs as decimal(30,2)))=0 OR SUM(CAST(w_cty_cupd as decimal(30,2)))/SUM(CAST(w_hrs_ldc21 as decimal(30,2)) + CAST(w_hrs_ldc22 as decimal(30,2)) + CAST(w_hrs_ldc23 as decimal(30,2)) + CAST(w_hrs_ldc24 as decimal(30,2)) + CAST(w_hrs_ldc26 as decimal(30,2)) + CAST(w_hrs_ldc27 as decimal(30,2)) + CAST(w_hrs_ldc28 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2)) + CAST(w_hrs_ldc92 as decimal(30,2))) =0
+                    THEN
+                        0
+                    ELSE
+                        ((SUM(CAST(w_cty_cupd as decimal(30,2)))/SUM(CAST(w_hrs_ldc21 as decimal(30,2)) + CAST(w_hrs_ldc22 as decimal(30,2)) + CAST(w_hrs_ldc23 as decimal(30,2)) + CAST(w_hrs_ldc24 as decimal(30,2)) +CAST(w_hrs_ldc26 as decimal(30,2)) + CAST(w_hrs_ldc27 as decimal(30,2)) + CAST(w_hrs_ldc28 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2)) + CAST(w_hrs_ldc92 as decimal(30,2))))
+                            - (SUM(CAST(w_sply_dels as decimal(30,2)))/SUM(CAST(w_sply_hrs as decimal(30,2)))))
+                        /(SUM(CAST(w_sply_dels as decimal(30,2)))/SUM(CAST(w_sply_hrs as decimal(30,2))))
+                    END
+                END dph2sply,
+
+                CASE WHEN SUM(CAST(w_vol_dps_ltr as decimal(30,2)))=0 THEN 0 ELSE (SUM(CAST(w_vol_dps_ltr as decimal(30,2)))/SUM(CAST(w_vol_cas_ltr+w_vol_dps_ltr as decimal(30,2)))) END dps_pct,
+
+                CASE WHEN SUM(CAST(w_vol_dps_flt as decimal(30,2)))=0 THEN 0 ELSE (SUM(CAST(w_vol_dps_flt as decimal(30,2)))/SUM(CAST(w_vol_cas_flt+w_vol_dps_flt as decimal(30,2)))) END fss_pct,
+
+                CASE WHEN SUM(CAST(w_vol_dps_ltr+ w_vol_dps_flt + w_vol_cas_flt + w_vol_cas_ltr AS BIGINT)) =0
+                THEN 0
+                ELSE
+                    SUM(CAST(w_vol_cas_flt + w_vol_cas_ltr AS BIGINT)) /SUM(CAST(w_vol_dps_ltr+ w_vol_dps_flt + w_vol_cas_flt + w_vol_cas_ltr AS DECIMAL(30,4)))
+                END ManVolPct,
+
+                CASE WHEN SUM(CAST(w_hrs_car_ot AS DECIMAL(30,4)))=0 OR SUM(CAST(w_hrs_car_tot AS DECIMAL(30,4)))=0 THEN 0 ELSE (SUM(CAST(w_hrs_car_ot AS DECIMAL(30,4)))/(SUM(CAST(w_hrs_car_tot AS DECIMAL(30,4))))) END ot_pct,
+
+                CASE WHEN SUM(CAST(cd_ern_hrs_ldc21 as decimal(30,2)) + cast(cd_ern_hrs_ldc22 as decimal(30,2)) +cast(cd_ern_hrs_ldc26 as decimal(30,2))) =0 OR SUM(CAST(b_collection_unit_ind as tinyint))=1 THEN 0
+                ELSE
+                    (((((SUM(cast(dbo.var_base.b_hrs_ldc21*w_del_days as decimal(30,8))+
+                    cast(dbo.var_base.b_hrs_ldc22*w_del_days as decimal(30,8)) +
+                    cast(dbo.var_base.b_hrs_ldc29*w_del_days as decimal(30,8)))
+                    +(SUM(cast(dbo.var_base.b_car_rte_nbr*w_del_days as decimal(30,8)))*4/
+                    cast(dbo.var_annual.ann_del_days as decimal(30,8)))))-
+                    SUM(cast(cd_ern_hrs_ldc21 as decimal(30,8))+
+                    cast(cd_ern_hrs_ldc22 as decimal(30,8))+
+                    cast(cd_ern_hrs_ldc26 as decimal(30,8)))*
+                    cast(prod_fters_fact as decimal(30,8)))
+                    /8)/sum(w_del_days))
+                END dly_fters_opp,
+
+                CASE WHEN SUM(CAST(w_hrs_ldc21 as decimal(30,2)) + CAST(w_hrs_ldc26 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2)))=0 THEN 0 ELSE ((((SUM(CAST(w_hrs_ldc21 as decimal(30,2)) + CAST(w_hrs_ldc26 as decimal(30,2)) + CAST(w_hrs_ldc29 as decimal(30,2))))-(SUM(CAST(cd_ern_hrs_ldc21 as decimal(30,2)) + CAST(cd_ern_hrs_ldc26 as decimal(30,2)))))/sum(w_del_days))/8) END dly_ofc_opp,
+
+                CASE WHEN SUM(cast(w_hrs_ldc22 as decimal(30,2)) + cast(cd_ern_hrs_ldc22 as decimal(30,2)))=0 THEN 0 ELSE (((SUM(cast(w_hrs_ldc22 as decimal(30,2)))-SUM(cast(cd_ern_hrs_ldc22 as decimal(30,2))))/sum(w_del_days))/8) END dly_str_opp,
+
+                CASE WHEN SUM(cast(w_hrs_ldc23 as decimal(30,2)) + cast(w_hrs_ldc27 as decimal(30,2)) + cast(cd_ern_hrs_ldc23 as decimal(30,2)) +cast(cd_ern_hrs_ldc27 as decimal(30,2)))=0 THEN 0 ELSE (((SUM(cast(w_hrs_ldc23 as decimal(30,2))+cast(w_hrs_ldc27 as decimal(30,2)))-((ISNULL(SUM(cast(cd_ern_hrs_ldc23 as decimal(30,2))+cast(cd_ern_hrs_ldc27 as decimal(30,2))),0))))/sum(w_del_days))/8) END dly_oth_opp,
+
+                CASE WHEN SUM(cast(w_hrs_ldc21 as decimal(30,2)) + cast(w_hrs_ldc26 as decimal(30,2)) + cast(w_hrs_ldc29 as decimal(30,2)) + cast(w_hrs_ldc23 as decimal(30,2)) + cast(w_hrs_ldc27 as decimal(30,2)))=0 THEN 0 ELSE ((((SUM(cast(w_hrs_ldc21 as decimal(30,2)) + cast(w_hrs_ldc26 as decimal(30,2)) + cast(w_hrs_ldc29 as decimal(30,2))))-(SUM(cast(cd_ern_hrs_ldc21 as decimal(30,2)) + cast(cd_ern_hrs_ldc26 as decimal(30,2)))))/sum(w_del_days))/8)+ (((SUM(cast(w_hrs_ldc22 as decimal(30,2)))-SUM(cast(cd_ern_hrs_ldc22 as decimal(30,2))))/sum(w_del_days))/8)+ (((SUM(cast(w_hrs_ldc23 as decimal(30,2))+cast(w_hrs_ldc27 as decimal(30,2)))-((ISNULL(SUM(cast(cd_ern_hrs_ldc23 as decimal(30,2))+cast(cd_ern_hrs_ldc27 as decimal(30,2))),0))))/sum(w_del_days))/8) END dly_tot_opp,
+
+                CASE WHEN SUM(cast(w_cty_cupd as decimal(30,2)))=0 OR SUM(cast(w_hrs_ldc21 as decimal(30,2)) + cast(w_hrs_ldc29 as decimal(30,2)))=0 THEN 0 ELSE SUM(cast(w_cty_cupd as decimal(30,2)))/SUM(cast(w_hrs_ldc21 as decimal(30,2)) + cast(w_hrs_ldc29 as decimal(30,2))) END aoei,
+
+                   CASE WHEN SUM(CAST(w_cty_cupd AS DECIMAL(30,2)))=0 OR SUM(CAST(w_hrs_ldc22 AS DECIMAL(30,2)))=0 THEN 0 ELSE (SUM(CAST(w_cty_cupd AS DECIMAL(30,4)))/SUM(CAST(w_hrs_ldc22 AS DECIMAL(30,2)))) END asei,
+
+                CASE WHEN SUM(cast(w_sply_dels AS DECIMAL(30,2)))=0 OR SUM(cast(w_hrs_ldc21sply AS DECIMAL(30,2)) +cast(w_hrs_ldc29sply AS DECIMAL(30,2)))=0 OR SUM(cast(w_hrs_ldc21 AS DECIMAL(30,2)) + cast(w_hrs_ldc29 AS DECIMAL(30,2)))=0 THEN 0 ELSE CASE WHEN SUM(cast(w_sply_dels AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc21sply AS DECIMAL(30,2)) + cast(w_hrs_ldc29sply AS DECIMAL(30,2)))=0 OR SUM(cast(w_cty_cupd AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc21 AS DECIMAL(30,2)) + cast(w_hrs_ldc29 AS DECIMAL(30,2)))=0 THEN 0 ELSE ((SUM(cast(w_cty_cupd AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc21 AS DECIMAL(30,2)) + cast(w_hrs_ldc29 AS DECIMAL(30,2))))-(SUM(cast(w_sply_dels AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc21sply AS DECIMAL(30,2)) + cast(w_hrs_ldc29sply AS DECIMAL(30,2)))))/(SUM(cast(w_sply_dels AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc21sply AS DECIMAL(30,2)) + cast(w_hrs_ldc29sply AS DECIMAL(30,2)))) END END oei2sply,
+
+                CASE WHEN SUM(cast(w_sply_dels AS DECIMAL(30,2)))=0 OR SUM(cast(w_hrs_ldc22sply AS DECIMAL(30,2)))=0 OR SUM(cast(w_hrs_ldc22 AS DECIMAL(30,2)))=0 THEN 0 ELSE CASE WHEN SUM(cast(w_sply_dels AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc22sply AS DECIMAL(30,2)))=0 OR SUM(cast(w_cty_cupd AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc22 AS DECIMAL(30,2)))=0 THEN 0 ELSE ((SUM(cast(w_cty_cupd AS DECIMAL(30,2)))/SUM(cast(w_hrs_ldc22 AS DECIMAL(30,2))))-(SUM(cast(w_sply_dels AS DECIMAL(30,2))) / SUM(cast(w_hrs_ldc22sply AS DECIMAL(30,2)))))/(SUM(cast(w_sply_dels AS DECIMAL(30,2))) / SUM(cast(w_hrs_ldc22sply AS DECIMAL(30,2)))) END END sei2sply,
+
+                (SUM(cd_ern_f2b_hrs_tot)/sum(w_del_days))/8 cd_ern_routes,
+                SUM(w_cty_rte)/COUNT(w_wk) w_cty_rte,
+                SUM(TotWebCoinsCarriers)/COUNT(w_wk)  TotWebCoinsCarriers
+
+            FROM var_base WITH(NOLOCK),var_weekly WITH(NOLOCK),var_calc_cdv WITH(NOLOCK),
+                #APPLICATION.dsn2#.dbo.avar_cdv_prod WITH(NOLOCK),var_annual with(nolock),vw_TotalCarriers
+            WHERE b_fin_nbr=w_fin_nbr
+                 AND b_fin_nbr=calc_fin_nbr
+                 AND b_fin_nbr=c_fin_nbr
+                 AND w_fy=calc_fy
+                 AND w_wk=calc_wk AND b_cdv_ind=1 AND b_mpoo<>'X'
+                 AND ((w_fy * 100) + w_wk) BETWEEN #ARGUMENTS.begFYWk# AND #ARGUMENTS.endFYWk#
+            GROUP BY b_area, b_area_name, prod_fters_fact, ann_del_days
+            ORDER BY dly_tot_opp desc
