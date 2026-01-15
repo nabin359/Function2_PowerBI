@@ -1,3 +1,87 @@
+
+USE [PCSV_dw];
+GO
+
+CREATE VIEW dbo.vw_rf_ldc_hrs_unit_source
+AS
+WITH LatestAudit AS (
+    SELECT
+        a.RequestID,
+        a.Comment,
+        a.ChangedBy,
+        a.ChangedDate,
+        a.OldStatus,
+        a.NewStatus,
+        a.Updated_Time,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.RequestID
+            ORDER BY a.ChangedDate DESC, a.AuditID DESC
+        ) AS rn
+    FROM PCSV_dw.dbo.FlexTimeAudit a WITH (NOLOCK)
+)
+SELECT
+    r.RequestID AS rf_id,
+
+    -- FY requested as "CreatedDate only year"
+    YEAR(r.CreatedDate) AS rf_fy,
+
+    r.Area_no    AS rf_area,
+    r.Cluster_no AS rf_cluster,
+
+    -- Finance number: prefer PO_FIN_NO; fallback to FacilityID if PO_FIN_NO is null
+    COALESCE(r.PO_FIN_NO, TRY_CONVERT(VARCHAR(50), r.FacilityID)) AS rf_fin_nbr,
+
+    r.LabourDistributionCode AS rf_ldc,
+
+    -- Requested amount (hours) + minutes
+    r.HoursPerWeek AS rf_amt,
+    CASE 
+        WHEN r.HoursPerWeek IS NULL THEN NULL
+        ELSE CAST(ROUND(r.HoursPerWeek * 60.0, 0) AS INT)
+    END AS rf_amt_minutes,
+
+    r.CreatedDate AS rf_dte,
+    r.OperationNumber AS rf_code,
+    r.Justification AS rf_comm,
+    r.CreatedBy AS rf_user_id,
+
+    -- Approved amount: use latest audit Updated_Time if present, else HoursPerWeek
+    COALESCE(la.Updated_Time, r.HoursPerWeek) AS rf_approve_amt,
+    CASE
+        WHEN COALESCE(la.Updated_Time, r.HoursPerWeek) IS NULL THEN NULL
+        ELSE CAST(ROUND(COALESCE(la.Updated_Time, r.HoursPerWeek) * 60.0, 0) AS INT)
+    END AS rf_approve_amt_minutes,
+
+    la.ChangedBy   AS rf_approve_id,
+    la.ChangedDate AS rf_approve_dte,
+
+    -- Approval/closure indicators (best-effort without hardcoding your exact status domain)
+    CASE 
+        WHEN UPPER(COALESCE(TRY_CONVERT(VARCHAR(50), la.NewStatus), TRY_CONVERT(VARCHAR(50), r.Status), '')) IN ('CLOSED') THEN 1
+        ELSE 0
+    END AS rf_approve_cls,
+
+    CASE 
+        WHEN UPPER(COALESCE(TRY_CONVERT(VARCHAR(50), la.NewStatus), TRY_CONVERT(VARCHAR(50), r.Status), '')) IN ('APPROVED','CLOSED') THEN 1
+        ELSE 0
+    END AS rf_approve_yes,
+
+    CASE 
+        WHEN UPPER(COALESCE(TRY_CONVERT(VARCHAR(50), la.NewStatus), TRY_CONVERT(VARCHAR(50), r.Status), '')) IN ('APPROVED','CLOSED') THEN 0
+        ELSE 1
+    END AS rf_approve_no,
+
+    la.Comment AS rf_approve_comm
+
+FROM PCSV_dw.dbo.FlexTimeRequests r WITH (NOLOCK)
+LEFT JOIN LatestAudit la
+    ON la.RequestID = r.RequestID
+   AND la.rn = 1;
+GO
+
+
+
+
 ---Natinal everything all together
 
 SELECT
