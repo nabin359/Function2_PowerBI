@@ -1,0 +1,1631 @@
+RDV.dbo.sp_rdv_weekly_update
+
+
+USE [RDV]
+GO
+/****** Object:  StoredProcedure [dbo].[sp_rdv_weekly_update]    Script Date: 1/22/2026 10:22:24 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Author:        DRUIZ
+-- Create date: 07202011
+-- Description:    Weekly RDV Update
+-- History
+--  2011-07-20: Initial version.
+--  2012-10-24: Modified lock code to use new method. wildgk
+--  2012-11-23: Updated flash update to also do week 1
+--  2013-03-13: GDW  Added Dave's BPIOUT massager to line length limit and preserve
+--              LTATS data at the end of the file.
+--  2013-09-30: Modified to only allow update of count/inspection routes table
+--              if update date is within 30 days of count (not inspection start). wildgk.
+--  2014-08-27: GDW  Added "Sum_8127 Multi Record Consolidator" to accommodate sum8127 file format change
+--              that start on 8/15/2014
+--  2014-09-21: GDW  Added "RTE-991-HOURS" support new in BPIOUT file (Number of Hours Worked, Sunday
+--                Package Delivery" (between existing RTE-OT-HOURS-FLSAA and REG-RTE-997-HOURS)
+--  2014-10-31: GDW  Added RTE 991 hour support in var_weekly fill from bpiout loaded data
+--  2014-11-05: GDW  Correct "Add One / Subtract One" misaligner ;)
+--  2015-01-14: GDW  Support the move of rur_vacant.csv to E:\Data\RURAL\Backup
+--  2015-08-14: GDW  'Grow' BPI columns in IMPORT_BPIOUT to support expansion from 4 and 5 characters to 6 characters to get around 99.99 limitation.
+--                   Add support for new columns for A995 and A996 Hours.
+--                   Adjust BCP 'stripper' to handle new 226/232 character BPIOUT file (formerly 204/210)
+--    2018-11-29: CBA     Added execution of sp_rdv_dms_aft
+--  2019-01-24: wildgk.  Abstracted F4 server name for update of var_base (new units) and var_weekly (COINS data).
+--  2020-07-23: wildgk.  Add new elements for new Wounded Warrior/CoViD19 data.
+--      bpi_out, import_bpiout, hold_bpi_out
+--          bpi_reg_rte_992_hrs_wwl
+--          bpi_reg_rte_992_hrs_covid
+--          bpi_daca_7days 
+--          bpi_daca_7eval_hrs
+--          bpi_daca_8days
+--          bpi_daca_8eval_hrs
+--          bpi_daca_9days
+--          bpi_daca_9eval_hrs
+--      var_weekly
+--          w_hrs_a992_wwl
+--          w_hrs_a992_covid
+--          w_daca_hrs_7_wwl (7 = Wounded Warrior Leave)
+--          w_daca_dys_7_wwl
+--          w_daca_hrs_8_esl (8 = Emergency Sick Leave)
+--          w_daca_dys_8_esl
+--          w_daca_hrs_9_phl (9 = Public Health Leave)
+--          w_daca_dys_9_phl
+--
+--      NOTE: IF ELEMENTS ARE ADDED TO THE BPIOUT SOURCE FILE
+--      THE TABLE COLUMNS ON THE *BPI* AND VAR_WEEKLY TABLES
+--      MUST BE INITIALIZED TO ZERO PRIOR TO FIRST LIVE RUN OR THE IMPORT WILL FAIL.
+--
+--  2020-08-26  CBA alter var_base updates to utilize new views as part of 2020 USPS Restructure (marker USPS2020)
+--  2022-12-09 wildgk. Updated to use new lock/unlock mechanism.
+-- =============================================
+ALTER PROCEDURE [dbo].[sp_rdv_weekly_update]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    --2022-12-09 wildgk. Use new lock/unlock mechanism.
+    exec var_servers.dbo.usp_application_lock_unlock
+         @entityIdentifier = 'RDV'
+        ,@lockInd = 1
+        ,@groupLockUnlockInd = 1;
+    
+-- For the rdv count/inspection table update check
+DECLARE 
+@CountStart DATETIME
+,@Today DATETIME
+,@DaySpan INT
+,@sql_cmd varchar(1000)
+,@sqlCmd nvarchar(1000);
+
+DECLARE @ann_nbr_weeks_sply smallint;
+
+SELECT TOP 1 @ann_nbr_weeks_sply = ann_nbr_weeks_sply
+FROM rdv.dbo.var_annual 
+ORDER BY ann_id desc;
+ print @ann_nbr_weeks_sply
+
+declare 
+@curfy int
+,@curwk int;
+
+set @curfy = (select top 1 vac_fy from RDV_DW.dbo.rur_vacant with(nolock) order by vac_fy desc);
+set @curwk = (select top 1 vac_wk from RDV_DW.dbo.rur_vacant with(nolock) order by vac_fy desc,vac_wk desc);
+
+-- ******************************
+-- "Next Week" After Current Max rur_vacant logic
+-- ******************************
+IF OBJECT_ID('tempdb..#rdv_calendar') IS NOT NULL BEGIN
+    DROP TABLE #rdv_calendar;
+END   
+
+select top 2 
+     row_number() OVER (order by (cal_fy_long*100)+cal_fy_wk ) ID
+    ,cal_fy_long, cal_fy_wk
+    ,(cal_fy_long*100)+cal_fy_wk fywk
+into #rdv_calendar
+from pcdv_dw.dbo.master_calendar with(nolock)
+where (cal_fy_long*100)+cal_fy_wk > (@curfy*100)+@curwk 
+and cal_del_days > 0
+group by cal_fy_long, cal_fy_wk, (cal_fy_long*100)+cal_fy_wk;
+
+declare @nextweek_fy int
+declare @nextweek_wk int
+declare @nextweek2_fy int
+declare @nextweek2_wk int
+
+set @nextweek_fy = (SELECT cal_fy_long from #rdv_calendar where ID=1)
+set @nextweek_wk = (SELECT cal_fy_wk from #rdv_calendar where ID=1)
+
+set @nextweek2_fy = (SELECT cal_fy_long from #rdv_calendar where ID=2)
+set @nextweek2_wk = (SELECT cal_fy_wk from #rdv_calendar where ID=2)
+
+select @curfy curfy, @curwk curwk, @nextweek_fy nextweek_fy, @nextweek_wk nextweek_wk, @nextweek2_fy nextweek2_fy, @nextweek2_wk nextweek2_wk
+
+truncate table RDV_DW.dbo.Import_rdv_Flash
+PRINT 'eFlash Import'
+DECLARE @rural_flash_b varchar(1000)
+SET @rural_flash_b = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_b.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_b)
+DECLARE @rural_flash_c varchar(1000)
+SET @rural_flash_c = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_c.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_c)
+DECLARE @rural_flash_e varchar(1000)
+SET @rural_flash_e = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_e.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_e)
+DECLARE @rural_flash_f varchar(1000)
+SET @rural_flash_f = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_f.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_f)
+DECLARE @rural_flash_g varchar(1000)
+SET @rural_flash_g = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_g.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_g)
+DECLARE @rural_flash_h varchar(1000)
+SET @rural_flash_h = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_h.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_h)    
+DECLARE @rural_flash_j varchar(1000)
+SET @rural_flash_j = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_j.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_j)    
+DECLARE @rural_flash_k varchar(1000)
+SET @rural_flash_k = 'BULK INSERT RDV_DW.dbo.Import_rdv_Flash from ''E:\Data\RURAL\Area_k.csv'' with (FIELDTERMINATOR = '','', ROWTERMINATOR = '''+CHAR(10)+''')'
+EXEC(@rural_flash_k)    
+PRINT 'eFlash Imported'
+
+--rural_extract import
+declare 
+@del_rur_extract varchar(255)
+,@Copy_rur_extract varchar(255)
+,@rename_rur_extract varchar(255);
+
+set @del_rur_extract = 'del E:\Data\Rural\Rural_extract.dat'
+set @Copy_rur_extract = 'copy E:\Data\Rural\Rural_extract_2*.Dat E:\Data\Rural\Backup\Rural_extract\'
+set @rename_rur_extract = 'rename E:\Data\Rural\Rural_extract_2*.Dat Rural_Extract.Dat'
+
+exec master..xp_cmdshell @del_rur_extract
+exec master..xp_cmdshell @Copy_rur_extract
+exec master..xp_cmdshell @rename_rur_extract
+
+print 'import_rural_extract import';
+-- DIVERT
+--BULK INSERT RDV_DW.dbo.import_rural_extract from 'E:\DATA\RURAL\Rural_extract.Dat' with (FORMATFILE='e:\data\rural\rural_extract.fmt')
+SET @sql_cmd = 'BULK INSERT RDV_DW.dbo.import_rural_extract from ''E:\DATA\RURAL\Rural_extract.Dat'' with (FORMATFILE=''e:\data\rural\rural_extract.fmt'')'
+print @sql_cmd
+EXEC(@sql_cmd)
+
+PRINT 'import_rural_extract Imported'
+
+--sum8127 import
+declare @del_sum8127 varchar(255)
+declare @Copy_sum8127 varchar(255)
+declare @rename_sum8127 varchar(255)
+        set @del_sum8127 = 'del E:\Data\Rural\sum8127'
+        set @Copy_sum8127 = 'copy E:\Data\Rural\sum8127_2* E:\Data\Rural\Backup\sum8127\'
+        set @rename_sum8127 = 'rename E:\Data\Rural\sum8127_2* sum8127'
+        exec master..xp_cmdshell @del_sum8127
+        exec master..xp_cmdshell @Copy_sum8127
+        exec master..xp_cmdshell @rename_sum8127
+PRINT 'sum8127 Import'
+-- 082714 GDW Use intermediate table so they can be consolidated.
+CREATE TABLE  dbo.[#sum8127_importt]([sum_finn] char(6),[sum_rtee] char(3),[sum_minss] int) 
+
+SET @sql_cmd = 'BULK INSERT #sum8127_importt from ''E:\DATA\RURAL\sum8127'' with (FIRSTROW = 2, FIELDTERMINATOR = '' '', ROWTERMINATOR = ''\n'')'
+print @sql_cmd
+EXEC(@sql_cmd)
+
+
+-- 082714 GDW Don't bulk insert here, did it above, instead use rolled up values into #sum8127_import
+-- New split record consolidator.
+select sum_finn sum_fin, sum_rtee sum_rte, SUM(sum_minss) sum_mins into #sum8127_import from #sum8127_importt 
+group by sum_finn, sum_rtee order by sum_finn, sum_rtee
+
+-- GDW show consolidation for one single office.
+PRINT 'Show 8127 Multi Record Consolidation, Raw Input'
+select * from #sum8127_importt where sum_finn=011550
+PRINT 'Show Consolidated records'
+select * from #sum8127_import where sum_fin=011550
+-- Original fill Import_sum8127 table
+insert into RDV_DW.dbo.Import_sum8127 (sum_fin_nbr,sum_rte_num,sum_8127_mins)
+select * from [#sum8127_import]
+
+drop table [#sum8127_import]
+drop table [#sum8127_importt]
+PRINT 'sum8127 Imported'
+
+--bpiout import
+-- GDW 031313.  
+--      Added Dave's BPIOUT massager to line length limit and preserve
+--      LTATS data at the end of the file
+--      Change 1: Bulk Insert original BPIOUT file into "VIRGIN" table
+--      Change 2: BCP SELECT from "VIRGIN" back to the BPIOUT file, proceed normally.
+--  081415: GDW Adjust BCP 'stripper' to handle new 226/232 character BPIOUT file (formerly 204/210)
+--  2020-07-23: wildgk. Adjust BCP 'stripper' to handle new 248/254 character BPIOUT file (formerly 226/232)
+--      for new CoViD 19 data elements (see main comments and bottom of format file elements 61-68 for source file, 62-29 for target table).
+
+declare 
+@del_bpiout varchar(255)
+,@Copy_bpiout varchar(255)
+,@rename_bpiout varchar(255)
+,@bcp_bpiout varchar(255);
+
+set @del_bpiout = 'del E:\Data\Rural\bpiout';
+set @Copy_bpiout = 'copy E:\Data\Rural\bpiout_2* E:\Data\Rural\Backup\bpiout\';
+set @rename_bpiout = 'rename E:\Data\Rural\bpiout_2* bpiout';
+
+exec master..xp_cmdshell @del_bpiout;
+exec master..xp_cmdshell @Copy_bpiout;
+exec master..xp_cmdshell @rename_bpiout;
+
+truncate table rdv_dw.dbo.[bpiout_virgin];
+
+set @sql_cmd = 'bulk insert rdv_dw.dbo.[bpiout_virgin] from ''e:\data\rural\bpiout'' with (rowterminator = ''\n'')';
+--set @sql_cmd = 'bulk insert rdv_dw.dbo.[bpiout_virgin] from ''e:\data\rural\bpiout'' with (rowterminator = ''0x0a'')';
+print @sql_cmd;
+exec(@sql_cmd);
+print 'bulk inserted raw bpiout file into bpiout_virgin';
+
+
+set @bcp_bpiout = 'bcp "select left(all_bpiout, 248) all_bpi from rdv_dw.dbo.bpiout_virgin" queryout e:\data\rural\bpiout -c -t -T';
+exec master..xp_cmdshell @bcp_bpiout;
+print 'restructured bpiout file created (LTATS records stripped)';
+
+
+set @sql_cmd = 'bulk insert rdv_dw.dbo.import_bpiout from ''e:\data\rural\bpiout'' with (formatfile=''e:\data\rural\bpiout.fmt'')';
+print @sql_cmd;
+exec(@sql_cmd);
+print 'bulk inserted trimmed bpiout file into import_bpiout';
+
+
+--rur_vacant import
+PRINT 'rur_vacant Import';
+CREATE TABLE  #rur_vacant_import(vac_cola varchar(10), vac_fin char(6),vac_rte char(3)) ;
+SET @sql_cmd = 'BULK INSERT #rur_vacant_import from ''E:\DATA\RURAL\rur_vacant.csv'' with (FIRSTROW = 2, FIELDTERMINATOR = '','', ROWTERMINATOR = ''\n'')';
+print @sql_cmd;
+EXEC(@sql_cmd);
+
+-- leading zero handler
+update #rur_vacant_import set vac_fin = '0' + vac_fin where len(vac_fin)=5
+update #rur_vacant_import set vac_rte = '00' + vac_rte where len(vac_rte)=1
+update #rur_vacant_import set vac_rte = '0' + vac_rte where len(vac_rte)=2
+
+insert into RDV_DW.dbo.rur_vacant (vac_fin_nbr,vac_rte) 
+select vac_fin,vac_rte 
+from #rur_vacant_import;
+
+update RDV_DW.dbo.rur_vacant 
+set vac_fy = @nextweek_fy,vac_wk = @nextweek_wk 
+where vac_fy=0;
+
+insert into RDV_DW.dbo.rur_vacant (vac_fin_nbr,vac_rte) 
+select vac_fin,vac_rte 
+from #rur_vacant_import;
+
+update RDV_DW.dbo.rur_vacant 
+set vac_fy = @nextweek2_fy,vac_wk = @nextweek2_wk 
+where vac_fy=0;
+
+drop table #rur_vacant_import
+PRINT 'rur_vacant Imported'
+
+--bpi_out update
+--  092114 GDW  Added "RTE-991-HOURS" support new in BPIOUT file (Number of Hours Worked, Sunday
+--                Package Delivery" (between existing RTE-OT-HOURS-FLSAA and REG-RTE-997-HOURS)
+--  081415: GDW  'Grow' BPI columns in IMPORT_BPIOUT to support expansion from 4 and 5 characters to 6 characters to get around 99.99 limitation.
+--                   Add support for new columns for A995 and A996 Hours.
+-- 2020-07-24: wildgk.  Add CoViD elements. A992 Wounded Warrior/CoViD, and DACA 7-9.
+PRINT 'Updating BPI_OUT'
+insert into RDV_DW.dbo.bpi_out (
+     bpi_fin_nbr
+    ,bpi_zip
+    ,bpi_zip_four
+    ,bpi_rte
+    ,bpi_fypp
+    ,bpi_pp
+    ,bpi_wkpp
+    ,bpi_code_52_hrs
+    ,bpi_ltats_wrk_hrs
+    ,bpi_ltats_ot_hrs
+    ,bpi_daca_xdays
+    ,bpi_daca_xeval_hrs
+    ,bpi_dat_fdays
+    ,bpi_dat_feval_hrs
+    ,bpi_aux_asst_trn_hrs
+    ,bpi_daca_tdays
+    ,bpi_daca_teval_hrs
+    ,bpi_daca_adays
+    ,bpi_daca_aeval_hrs
+    ,bpi_daca_odays
+    ,bpi_daca_oeval_hrs
+    ,bpi_daca_rdays
+    ,bpi_daca_reval_hrs
+    ,bpi_daca_3days
+    ,bpi_daca_3eval_hrs
+    ,bpi_daca_5days
+    ,bpi_daca_5eval_hrs
+    ,bpi_mile_dev
+    ,bpi_aux_rte_ovr40_hrs
+    ,bpi_aux_assit_hrs
+    ,bpi_reg_rte_ot_hrs_flsab
+    ,bpi_reg_rte_ot_hrs_flsaa
+    ,bpi_reg_rte_991_hrs
+    ,bpi_reg_rte_995_hrs
+    ,bpi_reg_rte_996_hrs
+    ,bpi_reg_rte_997_hrs
+    ,bpi_reg_rte_998_hrs
+    ,bpi_reg_rte_999_hrs
+    ,bpi_daca_xday_bal
+    ,bpi_daca_sdays
+    ,bpi_daca_seval_hrs
+    ,bpi_daca_edays
+    ,bpi_daca_eeval_hrs
+    ,bpi_daca_pdays
+    ,bpi_daca_peval_hrs
+    ,bpi_code_53_hrs
+    ,bpi_daca_bdays
+    ,bpi_daca_beval_hrs
+    ,bpi_daca_cdays
+    ,bpi_daca_ceval_hrs
+    ,bpi_daca_ldays
+    ,bpi_daca_leval_hrs
+    ,bpi_daca_wdays
+    ,bpi_daca_weval_hrs
+    ,bpi_daca_ydays
+    ,bpi_daca_yeval_hrs
+    ,bpi_sec_trip_min
+    ,bpi_reg_rte_992_hrs_wwl
+    ,bpi_reg_rte_992_hrs_covid
+    ,bpi_daca_7days
+    ,bpi_daca_7eval_hrs
+    ,bpi_daca_8days
+    ,bpi_daca_8eval_hrs
+    ,bpi_daca_9days
+    ,bpi_daca_9eval_hrs)
+select bpi_fin_nbr, bpi_zip, bpi_zip_four, bpi_rte, bpi_fy, bpi_pp, bpi_wk,
+cast(case 
+    when right(bpi_code_52_hrs,1) = '{' then replace(bpi_code_52_hrs,'{','0') when right(bpi_code_52_hrs,1) = 'A' then replace(bpi_code_52_hrs,'A','1')
+    when right(bpi_code_52_hrs,1) = 'B' then replace(bpi_code_52_hrs,'B','2') when right(bpi_code_52_hrs,1) = 'C' then replace(bpi_code_52_hrs,'C','3')
+    when right(bpi_code_52_hrs,1) = 'D' then replace(bpi_code_52_hrs,'D','4') when right(bpi_code_52_hrs,1) = 'E' then replace(bpi_code_52_hrs,'E','5')
+    when right(bpi_code_52_hrs,1) = 'F' then replace(bpi_code_52_hrs,'F','6') when right(bpi_code_52_hrs,1) = 'G' then replace(bpi_code_52_hrs,'G','7')
+    when right(bpi_code_52_hrs,1) = 'H' then replace(bpi_code_52_hrs,'H','8') when right(bpi_code_52_hrs,1) = 'I' then replace(bpi_code_52_hrs,'I','9')
+    when right(bpi_code_52_hrs,1) = '}' then replace('-'+bpi_code_52_hrs,'}','0') when right(bpi_code_52_hrs,1) = 'J' then replace('-'+bpi_code_52_hrs,'J','1')
+    when right(bpi_code_52_hrs,1) = 'K' then replace('-'+bpi_code_52_hrs,'K','2') when right(bpi_code_52_hrs,1) = 'L' then replace('-'+bpi_code_52_hrs,'L','3')
+    when right(bpi_code_52_hrs,1) = 'M' then replace('-'+bpi_code_52_hrs,'M','4') when right(bpi_code_52_hrs,1) = 'N' then replace('-'+bpi_code_52_hrs,'N','5')
+    when right(bpi_code_52_hrs,1) = 'O' then replace('-'+bpi_code_52_hrs,'O','6') when right(bpi_code_52_hrs,1) = 'P' then replace('-'+bpi_code_52_hrs,'P','7')
+    when right(bpi_code_52_hrs,1) = 'Q' then replace('-'+bpi_code_52_hrs,'Q','8') when right(bpi_code_52_hrs,1) = 'R' then replace('-'+bpi_code_52_hrs,'R','9')
+else bpi_code_52_hrs end as int) *.01 bpi_code_52_hrs, cast(case 
+when right(bpi_ltats_wrk_hrs,1) = '{' then replace(bpi_ltats_wrk_hrs,'{','0') when right(bpi_ltats_wrk_hrs,1) = 'A' then replace(bpi_ltats_wrk_hrs,'A','1') 
+when right(bpi_ltats_wrk_hrs,1) = 'B' then replace(bpi_ltats_wrk_hrs,'B','2') when right(bpi_ltats_wrk_hrs,1) = 'C' then replace(bpi_ltats_wrk_hrs,'C','3') 
+when right(bpi_ltats_wrk_hrs,1) = 'D' then replace(bpi_ltats_wrk_hrs,'D','4') when right(bpi_ltats_wrk_hrs,1) = 'E' then replace(bpi_ltats_wrk_hrs,'E','5') 
+when right(bpi_ltats_wrk_hrs,1) = 'F' then replace(bpi_ltats_wrk_hrs,'F','6') when right(bpi_ltats_wrk_hrs,1) = 'G' then replace(bpi_ltats_wrk_hrs,'G','7') 
+when right(bpi_ltats_wrk_hrs,1) = 'H' then replace(bpi_ltats_wrk_hrs,'H','8') when right(bpi_ltats_wrk_hrs,1) = 'I' then replace(bpi_ltats_wrk_hrs,'I','9') 
+when right(bpi_ltats_wrk_hrs,1) = '}' then replace('-'+bpi_ltats_wrk_hrs,'}','0') when right(bpi_ltats_wrk_hrs,1) = 'J' then replace('-'+bpi_ltats_wrk_hrs,'J','1') 
+when right(bpi_ltats_wrk_hrs,1) = 'K' then replace('-'+bpi_ltats_wrk_hrs,'K','2') when right(bpi_ltats_wrk_hrs,1) = 'L' then replace('-'+bpi_ltats_wrk_hrs,'L','3') 
+when right(bpi_ltats_wrk_hrs,1) = 'M' then replace('-'+bpi_ltats_wrk_hrs,'M','4') when right(bpi_ltats_wrk_hrs,1) = 'N' then replace('-'+bpi_ltats_wrk_hrs,'N','5') 
+when right(bpi_ltats_wrk_hrs,1) = 'O' then replace('-'+bpi_ltats_wrk_hrs,'O','6') when right(bpi_ltats_wrk_hrs,1) = 'P' then replace('-'+bpi_ltats_wrk_hrs,'P','7') 
+when right(bpi_ltats_wrk_hrs,1) = 'Q' then replace('-'+bpi_ltats_wrk_hrs,'Q','8') when right(bpi_ltats_wrk_hrs,1) = 'R' then replace('-'+bpi_ltats_wrk_hrs,'R','9') 
+else bpi_ltats_wrk_hrs end as int)bpi_ltats_wrk_hrs, cast(case 
+when right(bpi_ltats_ot_hrs,1) = '{' then replace(bpi_ltats_ot_hrs,'{','0') when right(bpi_ltats_ot_hrs,1) = 'A' then replace(bpi_ltats_ot_hrs,'A','1')
+when right(bpi_ltats_ot_hrs,1) = 'B' then replace(bpi_ltats_ot_hrs,'B','2') when right(bpi_ltats_ot_hrs,1) = 'C' then replace(bpi_ltats_ot_hrs,'C','3')
+when right(bpi_ltats_ot_hrs,1) = 'D' then replace(bpi_ltats_ot_hrs,'D','4') when right(bpi_ltats_ot_hrs,1) = 'E' then replace(bpi_ltats_ot_hrs,'E','5')
+when right(bpi_ltats_ot_hrs,1) = 'F' then replace(bpi_ltats_ot_hrs,'F','6') when right(bpi_ltats_ot_hrs,1) = 'G' then replace(bpi_ltats_ot_hrs,'G','7')
+when right(bpi_ltats_ot_hrs,1) = 'H' then replace(bpi_ltats_ot_hrs,'H','8') when right(bpi_ltats_ot_hrs,1) = 'I' then replace(bpi_ltats_ot_hrs,'I','9')
+when right(bpi_ltats_ot_hrs,1) = '}' then replace('-'+bpi_ltats_ot_hrs,'}','0') when right(bpi_ltats_ot_hrs,1) = 'J' then replace('-'+bpi_ltats_ot_hrs,'J','1')
+when right(bpi_ltats_ot_hrs,1) = 'K' then replace('-'+bpi_ltats_ot_hrs,'K','2') when right(bpi_ltats_ot_hrs,1) = 'L' then replace('-'+bpi_ltats_ot_hrs,'L','3')
+when right(bpi_ltats_ot_hrs,1) = 'M' then replace('-'+bpi_ltats_ot_hrs,'M','4') when right(bpi_ltats_ot_hrs,1) = 'N' then replace('-'+bpi_ltats_ot_hrs,'N','5')
+when right(bpi_ltats_ot_hrs,1) = 'O' then replace('-'+bpi_ltats_ot_hrs,'O','6') when right(bpi_ltats_ot_hrs,1) = 'P' then replace('-'+bpi_ltats_ot_hrs,'P','7')
+when right(bpi_ltats_ot_hrs,1) = 'Q' then replace('-'+bpi_ltats_ot_hrs,'Q','8') when right(bpi_ltats_ot_hrs,1) = 'R' then replace('-'+bpi_ltats_ot_hrs,'R','9')
+else bpi_ltats_ot_hrs end as int)bpi_ltats_ot_hrs, cast(case 
+when right(bpi_daca_xdays,1) = '{' then replace(bpi_daca_xdays,'{','0') when right(bpi_daca_xdays,1) = 'A' then replace(bpi_daca_xdays,'A','1')
+when right(bpi_daca_xdays,1) = 'B' then replace(bpi_daca_xdays,'B','2') when right(bpi_daca_xdays,1) = 'C' then replace(bpi_daca_xdays,'C','3')
+when right(bpi_daca_xdays,1) = 'D' then replace(bpi_daca_xdays,'D','4') when right(bpi_daca_xdays,1) = 'E' then replace(bpi_daca_xdays,'E','5')
+when right(bpi_daca_xdays,1) = 'F' then replace(bpi_daca_xdays,'F','6') when right(bpi_daca_xdays,1) = 'G' then replace(bpi_daca_xdays,'G','7')
+when right(bpi_daca_xdays,1) = 'H' then replace(bpi_daca_xdays,'H','8') when right(bpi_daca_xdays,1) = 'I' then replace(bpi_daca_xdays,'I','9')
+when right(bpi_daca_xdays,1) = '}' then replace('-'+bpi_daca_xdays,'}','0') when right(bpi_daca_xdays,1) = 'J' then replace('-'+bpi_daca_xdays,'J','1')
+when right(bpi_daca_xdays,1) = 'K' then replace('-'+bpi_daca_xdays,'K','2') when right(bpi_daca_xdays,1) = 'L' then replace('-'+bpi_daca_xdays,'L','3')
+when right(bpi_daca_xdays,1) = 'M' then replace('-'+bpi_daca_xdays,'M','4') when right(bpi_daca_xdays,1) = 'N' then replace('-'+bpi_daca_xdays,'N','5')
+when right(bpi_daca_xdays,1) = 'O' then replace('-'+bpi_daca_xdays,'O','6') when right(bpi_daca_xdays,1) = 'P' then replace('-'+bpi_daca_xdays,'P','7')
+when right(bpi_daca_xdays,1) = 'Q' then replace('-'+bpi_daca_xdays,'Q','8') when right(bpi_daca_xdays,1) = 'R' then replace('-'+bpi_daca_xdays,'R','9')
+else bpi_daca_xdays end as int)bpi_daca_xdays,cast(bpi_daca_xeval_hrs as int)*.01 bpi_daca_xeval_hrs, cast(case 
+when right(bpi_dat_fdays,1) = '{' then replace(bpi_dat_fdays,'{','0') when right(bpi_dat_fdays,1) = 'A' then replace(bpi_dat_fdays,'A','1')
+when right(bpi_dat_fdays,1) = 'B' then replace(bpi_dat_fdays,'B','2') when right(bpi_dat_fdays,1) = 'C' then replace(bpi_dat_fdays,'C','3')
+when right(bpi_dat_fdays,1) = 'D' then replace(bpi_dat_fdays,'D','4') when right(bpi_dat_fdays,1) = 'E' then replace(bpi_dat_fdays,'E','5')
+when right(bpi_dat_fdays,1) = 'F' then replace(bpi_dat_fdays,'F','6') when right(bpi_dat_fdays,1) = 'G' then replace(bpi_dat_fdays,'G','7')
+when right(bpi_dat_fdays,1) = 'H' then replace(bpi_dat_fdays,'H','8') when right(bpi_dat_fdays,1) = 'I' then replace(bpi_dat_fdays,'I','9')
+when right(bpi_dat_fdays,1) = '}' then replace('-'+bpi_dat_fdays,'}','0') when right(bpi_dat_fdays,1) = 'J' then replace('-'+bpi_dat_fdays,'J','1')
+when right(bpi_dat_fdays,1) = 'K' then replace('-'+bpi_dat_fdays,'K','2') when right(bpi_dat_fdays,1) = 'L' then replace('-'+bpi_dat_fdays,'L','3')
+when right(bpi_dat_fdays,1) = 'M' then replace('-'+bpi_dat_fdays,'M','4') when right(bpi_dat_fdays,1) = 'N' then replace('-'+bpi_dat_fdays,'N','5')
+when right(bpi_dat_fdays,1) = 'O' then replace('-'+bpi_dat_fdays,'O','6') when right(bpi_dat_fdays,1) = 'P' then replace('-'+bpi_dat_fdays,'P','7')
+when right(bpi_dat_fdays,1) = 'Q' then replace('-'+bpi_dat_fdays,'Q','8') when right(bpi_dat_fdays,1) = 'R' then replace('-'+bpi_dat_fdays,'R','9')
+else bpi_dat_fdays end as int)bpi_dat_fdays,cast(bpi_dat_feval_hrs as int)*.01 bpi_dat_feval_hrs,
+cast(bpi_aux_asst_trn_hrs as int)*.01 bpi_aux_asst_trn_hrs, cast(case 
+when right(bpi_daca_tdays,1) = '{' then replace(bpi_daca_tdays,'{','0') when right(bpi_daca_tdays,1) = 'A' then replace(bpi_daca_tdays,'A','1')
+when right(bpi_daca_tdays,1) = 'B' then replace(bpi_daca_tdays,'B','2') when right(bpi_daca_tdays,1) = 'C' then replace(bpi_daca_tdays,'C','3')
+when right(bpi_daca_tdays,1) = 'D' then replace(bpi_daca_tdays,'D','4') when right(bpi_daca_tdays,1) = 'E' then replace(bpi_daca_tdays,'E','5')
+when right(bpi_daca_tdays,1) = 'F' then replace(bpi_daca_tdays,'F','6') when right(bpi_daca_tdays,1) = 'G' then replace(bpi_daca_tdays,'G','7')
+when right(bpi_daca_tdays,1) = 'H' then replace(bpi_daca_tdays,'H','8') when right(bpi_daca_tdays,1) = 'I' then replace(bpi_daca_tdays,'I','9')
+when right(bpi_daca_tdays,1) = '}' then replace('-'+bpi_daca_tdays,'}','0') when right(bpi_daca_tdays,1) = 'J' then replace('-'+bpi_daca_tdays,'J','1')
+when right(bpi_daca_tdays,1) = 'K' then replace('-'+bpi_daca_tdays,'K','2') when right(bpi_daca_tdays,1) = 'L' then replace('-'+bpi_daca_tdays,'L','3')
+when right(bpi_daca_tdays,1) = 'M' then replace('-'+bpi_daca_tdays,'M','4') when right(bpi_daca_tdays,1) = 'N' then replace('-'+bpi_daca_tdays,'N','5')
+when right(bpi_daca_tdays,1) = 'O' then replace('-'+bpi_daca_tdays,'O','6') when right(bpi_daca_tdays,1) = 'P' then replace('-'+bpi_daca_tdays,'P','7')
+when right(bpi_daca_tdays,1) = 'Q' then replace('-'+bpi_daca_tdays,'Q','8') when right(bpi_daca_tdays,1) = 'R' then replace('-'+bpi_daca_tdays,'R','9')
+else bpi_daca_tdays end as int)bpi_daca_tdays, cast(bpi_daca_teval_hrs as int)*.01 bpi_daca_teval_hrs, cast(case 
+when right(bpi_daca_adays,1) = '{' then replace(bpi_daca_adays,'{','0') when right(bpi_daca_adays,1) = 'A' then replace(bpi_daca_adays,'A','1')
+when right(bpi_daca_adays,1) = 'B' then replace(bpi_daca_adays,'B','2') when right(bpi_daca_adays,1) = 'C' then replace(bpi_daca_adays,'C','3')
+when right(bpi_daca_adays,1) = 'D' then replace(bpi_daca_adays,'D','4') when right(bpi_daca_adays,1) = 'E' then replace(bpi_daca_adays,'E','5')
+when right(bpi_daca_adays,1) = 'F' then replace(bpi_daca_adays,'F','6') when right(bpi_daca_adays,1) = 'G' then replace(bpi_daca_adays,'G','7')
+when right(bpi_daca_adays,1) = 'H' then replace(bpi_daca_adays,'H','8') when right(bpi_daca_adays,1) = 'I' then replace(bpi_daca_adays,'I','9')
+when right(bpi_daca_adays,1) = '}' then replace('-'+bpi_daca_adays,'}','0') when right(bpi_daca_adays,1) = 'J' then replace('-'+bpi_daca_adays,'J','1')
+when right(bpi_daca_adays,1) = 'K' then replace('-'+bpi_daca_adays,'K','2') when right(bpi_daca_adays,1) = 'L' then replace('-'+bpi_daca_adays,'L','3')
+when right(bpi_daca_adays,1) = 'M' then replace('-'+bpi_daca_adays,'M','4') when right(bpi_daca_adays,1) = 'N' then replace('-'+bpi_daca_adays,'N','5')
+when right(bpi_daca_adays,1) = 'O' then replace('-'+bpi_daca_adays,'O','6') when right(bpi_daca_adays,1) = 'P' then replace('-'+bpi_daca_adays,'P','7')
+when right(bpi_daca_adays,1) = 'Q' then replace('-'+bpi_daca_adays,'Q','8') when right(bpi_daca_adays,1) = 'R' then replace('-'+bpi_daca_adays,'R','9')
+else bpi_daca_adays end as int) bpi_daca_adays,cast(bpi_daca_aeval_hrs as int)*.01 bpi_daca_aeval_hrs, cast(case 
+when right(bpi_daca_odays,1) = '{' then replace(bpi_daca_odays,'{','0') when right(bpi_daca_odays,1) = 'A' then replace(bpi_daca_odays,'A','1')
+when right(bpi_daca_odays,1) = 'B' then replace(bpi_daca_odays,'B','2') when right(bpi_daca_odays,1) = 'C' then replace(bpi_daca_odays,'C','3')
+when right(bpi_daca_odays,1) = 'D' then replace(bpi_daca_odays,'D','4') when right(bpi_daca_odays,1) = 'E' then replace(bpi_daca_odays,'E','5')
+when right(bpi_daca_odays,1) = 'F' then replace(bpi_daca_odays,'F','6') when right(bpi_daca_odays,1) = 'G' then replace(bpi_daca_odays,'G','7')
+when right(bpi_daca_odays,1) = 'H' then replace(bpi_daca_odays,'H','8') when right(bpi_daca_odays,1) = 'I' then replace(bpi_daca_odays,'I','9')
+when right(bpi_daca_odays,1) = '}' then replace('-'+bpi_daca_odays,'}','0') when right(bpi_daca_odays,1) = 'J' then replace('-'+bpi_daca_odays,'J','1')
+when right(bpi_daca_odays,1) = 'K' then replace('-'+bpi_daca_odays,'K','2') when right(bpi_daca_odays,1) = 'L' then replace('-'+bpi_daca_odays,'L','3')
+when right(bpi_daca_odays,1) = 'M' then replace('-'+bpi_daca_odays,'M','4') when right(bpi_daca_odays,1) = 'N' then replace('-'+bpi_daca_odays,'N','5')
+when right(bpi_daca_odays,1) = 'O' then replace('-'+bpi_daca_odays,'O','6') when right(bpi_daca_odays,1) = 'P' then replace('-'+bpi_daca_odays,'P','7')
+when right(bpi_daca_odays,1) = 'Q' then replace('-'+bpi_daca_odays,'Q','8') when right(bpi_daca_odays,1) = 'R' then replace('-'+bpi_daca_odays,'R','9')
+else bpi_daca_odays end as int) bpi_daca_odays,cast(bpi_daca_oeval_hrs as int)*.01 bpi_daca_oeval_hrs, cast(case 
+when right(bpi_daca_rdays,1) = '{' then replace(bpi_daca_rdays,'{','0') when right(bpi_daca_rdays,1) = 'A' then replace(bpi_daca_rdays,'A','1')
+when right(bpi_daca_rdays,1) = 'B' then replace(bpi_daca_rdays,'B','2') when right(bpi_daca_rdays,1) = 'C' then replace(bpi_daca_rdays,'C','3')
+when right(bpi_daca_rdays,1) = 'D' then replace(bpi_daca_rdays,'D','4') when right(bpi_daca_rdays,1) = 'E' then replace(bpi_daca_rdays,'E','5')
+when right(bpi_daca_rdays,1) = 'F' then replace(bpi_daca_rdays,'F','6') when right(bpi_daca_rdays,1) = 'G' then replace(bpi_daca_rdays,'G','7')
+when right(bpi_daca_rdays,1) = 'H' then replace(bpi_daca_rdays,'H','8') when right(bpi_daca_rdays,1) = 'I' then replace(bpi_daca_rdays,'I','9')
+when right(bpi_daca_rdays,1) = '}' then replace('-'+bpi_daca_rdays,'}','0') when right(bpi_daca_rdays,1) = 'J' then replace('-'+bpi_daca_rdays,'J','1')
+when right(bpi_daca_rdays,1) = 'K' then replace('-'+bpi_daca_rdays,'K','2') when right(bpi_daca_rdays,1) = 'L' then replace('-'+bpi_daca_rdays,'L','3')
+when right(bpi_daca_rdays,1) = 'M' then replace('-'+bpi_daca_rdays,'M','4') when right(bpi_daca_rdays,1) = 'N' then replace('-'+bpi_daca_rdays,'N','5')
+when right(bpi_daca_rdays,1) = 'O' then replace('-'+bpi_daca_rdays,'O','6') when right(bpi_daca_rdays,1) = 'P' then replace('-'+bpi_daca_rdays,'P','7')
+when right(bpi_daca_rdays,1) = 'Q' then replace('-'+bpi_daca_rdays,'Q','8') when right(bpi_daca_rdays,1) = 'R' then replace('-'+bpi_daca_rdays,'R','9')
+else bpi_daca_rdays end as int) bpi_daca_rdays,cast(bpi_daca_reval_hrs as int)*.01 bpi_daca_reval_hrs, cast(case 
+when right(bpi_daca_3days,1) = '{' then replace(bpi_daca_3days,'{','0') when right(bpi_daca_3days,1) = 'A' then replace(bpi_daca_3days,'A','1')
+when right(bpi_daca_3days,1) = 'B' then replace(bpi_daca_3days,'B','2') when right(bpi_daca_3days,1) = 'C' then replace(bpi_daca_3days,'C','3')
+when right(bpi_daca_3days,1) = 'D' then replace(bpi_daca_3days,'D','4') when right(bpi_daca_3days,1) = 'E' then replace(bpi_daca_3days,'E','5')
+when right(bpi_daca_3days,1) = 'F' then replace(bpi_daca_3days,'F','6') when right(bpi_daca_3days,1) = 'G' then replace(bpi_daca_3days,'G','7')
+when right(bpi_daca_3days,1) = 'H' then replace(bpi_daca_3days,'H','8') when right(bpi_daca_3days,1) = 'I' then replace(bpi_daca_3days,'I','9')
+when right(bpi_daca_3days,1) = '}' then replace('-'+bpi_daca_3days,'}','0') when right(bpi_daca_3days,1) = 'J' then replace('-'+bpi_daca_3days,'J','1')
+when right(bpi_daca_3days,1) = 'K' then replace('-'+bpi_daca_3days,'K','2') when right(bpi_daca_3days,1) = 'L' then replace('-'+bpi_daca_3days,'L','3')
+when right(bpi_daca_3days,1) = 'M' then replace('-'+bpi_daca_3days,'M','4') when right(bpi_daca_3days,1) = 'N' then replace('-'+bpi_daca_3days,'N','5')
+when right(bpi_daca_3days,1) = 'O' then replace('-'+bpi_daca_3days,'O','6') when right(bpi_daca_3days,1) = 'P' then replace('-'+bpi_daca_3days,'P','7')
+when right(bpi_daca_3days,1) = 'Q' then replace('-'+bpi_daca_3days,'Q','8') when right(bpi_daca_3days,1) = 'R' then replace('-'+bpi_daca_3days,'R','9')
+else bpi_daca_3days end as int) bpi_daca_3days,cast(bpi_daca_3eval_hrs as int)*.01 bpi_daca_3eval_hrs, cast(case 
+when right(bpi_daca_5days,1) = '{' then replace(bpi_daca_5days,'{','0') when right(bpi_daca_5days,1) = 'A' then replace(bpi_daca_5days,'A','1')
+when right(bpi_daca_5days,1) = 'B' then replace(bpi_daca_5days,'B','2') when right(bpi_daca_5days,1) = 'C' then replace(bpi_daca_5days,'C','3')
+when right(bpi_daca_5days,1) = 'D' then replace(bpi_daca_5days,'D','4') when right(bpi_daca_5days,1) = 'E' then replace(bpi_daca_5days,'E','5')
+when right(bpi_daca_5days,1) = 'F' then replace(bpi_daca_5days,'F','6') when right(bpi_daca_5days,1) = 'G' then replace(bpi_daca_5days,'G','7')
+when right(bpi_daca_5days,1) = 'H' then replace(bpi_daca_5days,'H','8') when right(bpi_daca_5days,1) = 'I' then replace(bpi_daca_5days,'I','9')
+when right(bpi_daca_5days,1) = '}' then replace('-'+bpi_daca_5days,'}','0') when right(bpi_daca_5days,1) = 'J' then replace('-'+bpi_daca_5days,'J','1')
+when right(bpi_daca_5days,1) = 'K' then replace('-'+bpi_daca_5days,'K','2') when right(bpi_daca_5days,1) = 'L' then replace('-'+bpi_daca_5days,'L','3')
+when right(bpi_daca_5days,1) = 'M' then replace('-'+bpi_daca_5days,'M','4') when right(bpi_daca_5days,1) = 'N' then replace('-'+bpi_daca_5days,'N','5')
+when right(bpi_daca_5days,1) = 'O' then replace('-'+bpi_daca_5days,'O','6') when right(bpi_daca_5days,1) = 'P' then replace('-'+bpi_daca_5days,'P','7')
+when right(bpi_daca_5days,1) = 'Q' then replace('-'+bpi_daca_5days,'Q','8') when right(bpi_daca_5days,1) = 'R' then replace('-'+bpi_daca_5days,'R','9')
+else bpi_daca_5days end as int) bpi_daca_5days,cast(bpi_daca_5eval_hrs as int)*.01 bpi_daca_5eval_hrs,
+cast(bpi_mile_dev as int) bpi_mile_dev, cast(bpi_aux_rte_ovr40_hrs as int)*.01 bpi_aux_rte_ovr40_hrs, 
+cast(bpi_aux_assit_hrs as int)*.01 bpi_aux_assit_hrs,cast(bpi_reg_rte_ot_hrs_flsab as int)*.01 bpi_reg_rte_ot_hrs_flsab, 
+cast(bpi_reg_rte_ot_hrs_flsaa as int)*.01 bpi_reg_rte_ot_hrs_flsaa,
+--  092114 GDW  Added "RTE-991-HOURS" support new in BPIOUT file (Number of Hours Worked, Sunday
+--                Package Delivery" (between existing RTE-OT-HOURS-FLSAA and REG-RTE-997-HOURS(
+cast(bpi_reg_rte_991_hrs as int)*.01 bpi_reg_rte_991_hrs, 
+--  081415 GDW  Added "RTE-995-HRS" and RTE-996-HRS, new in BPIOUT file
+cast(bpi_reg_rte_995_hrs as int)*.01 bpi_reg_rte_995_hrs, 
+cast(bpi_reg_rte_996_hrs as int)*.01 bpi_reg_rte_996_hrs, 
+cast(bpi_reg_rte_997_hrs as int)*.01 bpi_reg_rte_997_hrs, 
+cast(bpi_reg_rte_998_hrs as int)*.01 bpi_reg_rte_998_hrs, 
+cast(bpi_reg_rte_999_hrs as int)*.01 bpi_reg_rte_999_hrs, 
+cast(case 
+when right(bpi_daca_xday_bal,1) = '{' then replace(bpi_daca_xday_bal,'{','0') when right(bpi_daca_xday_bal,1) = 'A' then replace(bpi_daca_xday_bal,'A','1')
+when right(bpi_daca_xday_bal,1) = 'B' then replace(bpi_daca_xday_bal,'B','2') when right(bpi_daca_xday_bal,1) = 'C' then replace(bpi_daca_xday_bal,'C','3')
+when right(bpi_daca_xday_bal,1) = 'D' then replace(bpi_daca_xday_bal,'D','4') when right(bpi_daca_xday_bal,1) = 'E' then replace(bpi_daca_xday_bal,'E','5')
+when right(bpi_daca_xday_bal,1) = 'F' then replace(bpi_daca_xday_bal,'F','6') when right(bpi_daca_xday_bal,1) = 'G' then replace(bpi_daca_xday_bal,'G','7')
+when right(bpi_daca_xday_bal,1) = 'H' then replace(bpi_daca_xday_bal,'H','8') when right(bpi_daca_xday_bal,1) = 'I' then replace(bpi_daca_xday_bal,'I','9')
+when right(bpi_daca_xday_bal,1) = '}' then replace('-'+bpi_daca_xday_bal,'}','0') when right(bpi_daca_xday_bal,1) = 'J' then replace('-'+bpi_daca_xday_bal,'J','1')
+when right(bpi_daca_xday_bal,1) = 'K' then replace('-'+bpi_daca_xday_bal,'K','2') when right(bpi_daca_xday_bal,1) = 'L' then replace('-'+bpi_daca_xday_bal,'L','3')
+when right(bpi_daca_xday_bal,1) = 'M' then replace('-'+bpi_daca_xday_bal,'M','4') when right(bpi_daca_xday_bal,1) = 'N' then replace('-'+bpi_daca_xday_bal,'N','5')
+when right(bpi_daca_xday_bal,1) = 'O' then replace('-'+bpi_daca_xday_bal,'O','6') when right(bpi_daca_xday_bal,1) = 'P' then replace('-'+bpi_daca_xday_bal,'P','7')
+when right(bpi_daca_xday_bal,1) = 'Q' then replace('-'+bpi_daca_xday_bal,'Q','8') when right(bpi_daca_xday_bal,1) = 'R' then replace('-'+bpi_daca_xday_bal,'R','9')
+else bpi_daca_xday_bal end as int) bpi_daca_xday_bal, cast(case 
+when right(bpi_daca_sdays,1) = '{' then replace(bpi_daca_sdays,'{','0') when right(bpi_daca_sdays,1) = 'A' then replace(bpi_daca_sdays,'A','1')
+when right(bpi_daca_sdays,1) = 'B' then replace(bpi_daca_sdays,'B','2') when right(bpi_daca_sdays,1) = 'C' then replace(bpi_daca_sdays,'C','3')
+when right(bpi_daca_sdays,1) = 'D' then replace(bpi_daca_sdays,'D','4') when right(bpi_daca_sdays,1) = 'E' then replace(bpi_daca_sdays,'E','5')
+when right(bpi_daca_sdays,1) = 'F' then replace(bpi_daca_sdays,'F','6') when right(bpi_daca_sdays,1) = 'G' then replace(bpi_daca_sdays,'G','7')
+when right(bpi_daca_sdays,1) = 'H' then replace(bpi_daca_sdays,'H','8') when right(bpi_daca_sdays,1) = 'I' then replace(bpi_daca_sdays,'I','9')
+when right(bpi_daca_sdays,1) = '}' then replace('-'+bpi_daca_sdays,'}','0') when right(bpi_daca_sdays,1) = 'J' then replace('-'+bpi_daca_sdays,'J','1')
+when right(bpi_daca_sdays,1) = 'K' then replace('-'+bpi_daca_sdays,'K','2') when right(bpi_daca_sdays,1) = 'L' then replace('-'+bpi_daca_sdays,'L','3')
+when right(bpi_daca_sdays,1) = 'M' then replace('-'+bpi_daca_sdays,'M','4') when right(bpi_daca_sdays,1) = 'N' then replace('-'+bpi_daca_sdays,'N','5')
+when right(bpi_daca_sdays,1) = 'O' then replace('-'+bpi_daca_sdays,'O','6') when right(bpi_daca_sdays,1) = 'P' then replace('-'+bpi_daca_sdays,'P','7')
+when right(bpi_daca_sdays,1) = 'Q' then replace('-'+bpi_daca_sdays,'Q','8') when right(bpi_daca_sdays,1) = 'R' then replace('-'+bpi_daca_sdays,'R','9')
+else bpi_daca_sdays end as int) bpi_daca_sdays,cast(bpi_daca_seval_hrs as int)*.01 bpi_daca_seval_hrs, cast(case 
+when right(bpi_daca_edays,1) = '{' then replace(bpi_daca_edays,'{','0') when right(bpi_daca_edays,1) = 'A' then replace(bpi_daca_edays,'A','1')
+when right(bpi_daca_edays,1) = 'B' then replace(bpi_daca_edays,'B','2') when right(bpi_daca_edays,1) = 'C' then replace(bpi_daca_edays,'C','3')
+when right(bpi_daca_edays,1) = 'D' then replace(bpi_daca_edays,'D','4') when right(bpi_daca_edays,1) = 'E' then replace(bpi_daca_edays,'E','5')
+when right(bpi_daca_edays,1) = 'F' then replace(bpi_daca_edays,'F','6') when right(bpi_daca_edays,1) = 'G' then replace(bpi_daca_edays,'G','7')
+when right(bpi_daca_edays,1) = 'H' then replace(bpi_daca_edays,'H','8') when right(bpi_daca_edays,1) = 'I' then replace(bpi_daca_edays,'I','9')
+when right(bpi_daca_edays,1) = '}' then replace('-'+bpi_daca_edays,'}','0') when right(bpi_daca_edays,1) = 'J' then replace('-'+bpi_daca_edays,'J','1')
+when right(bpi_daca_edays,1) = 'K' then replace('-'+bpi_daca_edays,'K','2') when right(bpi_daca_edays,1) = 'L' then replace('-'+bpi_daca_edays,'L','3')
+when right(bpi_daca_edays,1) = 'M' then replace('-'+bpi_daca_edays,'M','4') when right(bpi_daca_edays,1) = 'N' then replace('-'+bpi_daca_edays,'N','5')
+when right(bpi_daca_edays,1) = 'O' then replace('-'+bpi_daca_edays,'O','6') when right(bpi_daca_edays,1) = 'P' then replace('-'+bpi_daca_edays,'P','7')
+when right(bpi_daca_edays,1) = 'Q' then replace('-'+bpi_daca_edays,'Q','8') when right(bpi_daca_edays,1) = 'R' then replace('-'+bpi_daca_edays,'R','9')
+else bpi_daca_edays end as int) bpi_daca_edays,cast(bpi_daca_eeval_hrs as int)*.01 bpi_daca_eeval_hrs, cast(case 
+when right(bpi_daca_pdays,1) = '{' then replace(bpi_daca_pdays,'{','0') when right(bpi_daca_pdays,1) = 'A' then replace(bpi_daca_pdays,'A','1')
+when right(bpi_daca_pdays,1) = 'B' then replace(bpi_daca_pdays,'B','2') when right(bpi_daca_pdays,1) = 'C' then replace(bpi_daca_pdays,'C','3')
+when right(bpi_daca_pdays,1) = 'D' then replace(bpi_daca_pdays,'D','4') when right(bpi_daca_pdays,1) = 'E' then replace(bpi_daca_pdays,'E','5')
+when right(bpi_daca_pdays,1) = 'F' then replace(bpi_daca_pdays,'F','6') when right(bpi_daca_pdays,1) = 'G' then replace(bpi_daca_pdays,'G','7')
+when right(bpi_daca_pdays,1) = 'H' then replace(bpi_daca_pdays,'H','8') when right(bpi_daca_pdays,1) = 'I' then replace(bpi_daca_pdays,'I','9')
+when right(bpi_daca_pdays,1) = '}' then replace('-'+bpi_daca_pdays,'}','0') when right(bpi_daca_pdays,1) = 'J' then replace('-'+bpi_daca_pdays,'J','1')
+when right(bpi_daca_pdays,1) = 'K' then replace('-'+bpi_daca_pdays,'K','2') when right(bpi_daca_pdays,1) = 'L' then replace('-'+bpi_daca_pdays,'L','3')
+when right(bpi_daca_pdays,1) = 'M' then replace('-'+bpi_daca_pdays,'M','4') when right(bpi_daca_pdays,1) = 'N' then replace('-'+bpi_daca_pdays,'N','5')
+when right(bpi_daca_pdays,1) = 'O' then replace('-'+bpi_daca_pdays,'O','6') when right(bpi_daca_pdays,1) = 'P' then replace('-'+bpi_daca_pdays,'P','7')
+when right(bpi_daca_pdays,1) = 'Q' then replace('-'+bpi_daca_pdays,'Q','8') when right(bpi_daca_pdays,1) = 'R' then replace('-'+bpi_daca_pdays,'R','9')
+else bpi_daca_pdays end as int) bpi_daca_pdays,cast(bpi_daca_peval_hrs as int)*.01 bpi_daca_peval_hrs,
+cast(bpi_code_53_hrs as int)*.01 bpi_code_53_hrs, cast(case 
+when right(bpi_daca_bdays,1) = '{' then replace(bpi_daca_bdays,'{','0') when right(bpi_daca_bdays,1) = 'A' then replace(bpi_daca_bdays,'A','1')
+when right(bpi_daca_bdays,1) = 'B' then replace(bpi_daca_bdays,'B','2') when right(bpi_daca_bdays,1) = 'C' then replace(bpi_daca_bdays,'C','3')
+when right(bpi_daca_bdays,1) = 'D' then replace(bpi_daca_bdays,'D','4') when right(bpi_daca_bdays,1) = 'E' then replace(bpi_daca_bdays,'E','5')
+when right(bpi_daca_bdays,1) = 'F' then replace(bpi_daca_bdays,'F','6') when right(bpi_daca_bdays,1) = 'G' then replace(bpi_daca_bdays,'G','7')
+when right(bpi_daca_bdays,1) = 'H' then replace(bpi_daca_bdays,'H','8') when right(bpi_daca_bdays,1) = 'I' then replace(bpi_daca_bdays,'I','9')
+when right(bpi_daca_bdays,1) = '}' then replace('-'+bpi_daca_bdays,'}','0') when right(bpi_daca_bdays,1) = 'J' then replace('-'+bpi_daca_bdays,'J','1')
+when right(bpi_daca_bdays,1) = 'K' then replace('-'+bpi_daca_bdays,'K','2') when right(bpi_daca_bdays,1) = 'L' then replace('-'+bpi_daca_bdays,'L','3')
+when right(bpi_daca_bdays,1) = 'M' then replace('-'+bpi_daca_bdays,'M','4') when right(bpi_daca_bdays,1) = 'N' then replace('-'+bpi_daca_bdays,'N','5')
+when right(bpi_daca_bdays,1) = 'O' then replace('-'+bpi_daca_bdays,'O','6') when right(bpi_daca_bdays,1) = 'P' then replace('-'+bpi_daca_bdays,'P','7')
+when right(bpi_daca_bdays,1) = 'Q' then replace('-'+bpi_daca_bdays,'Q','8') when right(bpi_daca_bdays,1) = 'R' then replace('-'+bpi_daca_bdays,'R','9')
+else bpi_daca_bdays end as int) bpi_daca_bdays,cast(bpi_daca_beval_hrs as int)*.01 bpi_daca_beval_hrs, cast(case 
+when right(bpi_daca_cdays,1) = '{' then replace(bpi_daca_cdays,'{','0') when right(bpi_daca_cdays,1) = 'A' then replace(bpi_daca_cdays,'A','1')
+when right(bpi_daca_cdays,1) = 'B' then replace(bpi_daca_cdays,'B','2') when right(bpi_daca_cdays,1) = 'C' then replace(bpi_daca_cdays,'C','3')
+when right(bpi_daca_cdays,1) = 'D' then replace(bpi_daca_cdays,'D','4') when right(bpi_daca_cdays,1) = 'E' then replace(bpi_daca_cdays,'E','5')
+when right(bpi_daca_cdays,1) = 'F' then replace(bpi_daca_cdays,'F','6') when right(bpi_daca_cdays,1) = 'G' then replace(bpi_daca_cdays,'G','7')
+when right(bpi_daca_cdays,1) = 'H' then replace(bpi_daca_cdays,'H','8') when right(bpi_daca_cdays,1) = 'I' then replace(bpi_daca_cdays,'I','9')
+when right(bpi_daca_cdays,1) = '}' then replace('-'+bpi_daca_cdays,'}','0') when right(bpi_daca_cdays,1) = 'J' then replace('-'+bpi_daca_cdays,'J','1')
+when right(bpi_daca_cdays,1) = 'K' then replace('-'+bpi_daca_cdays,'K','2') when right(bpi_daca_cdays,1) = 'L' then replace('-'+bpi_daca_cdays,'L','3')
+when right(bpi_daca_cdays,1) = 'M' then replace('-'+bpi_daca_cdays,'M','4') when right(bpi_daca_cdays,1) = 'N' then replace('-'+bpi_daca_cdays,'N','5')
+when right(bpi_daca_cdays,1) = 'O' then replace('-'+bpi_daca_cdays,'O','6') when right(bpi_daca_cdays,1) = 'P' then replace('-'+bpi_daca_cdays,'P','7')
+when right(bpi_daca_cdays,1) = 'Q' then replace('-'+bpi_daca_cdays,'Q','8') when right(bpi_daca_cdays,1) = 'R' then replace('-'+bpi_daca_cdays,'R','9')
+else bpi_daca_cdays end as int) bpi_daca_cdays,cast(bpi_daca_ceval_hrs as int)*.01 bpi_daca_ceval_hrs, cast(case 
+when right(bpi_daca_ldays,1) = '{' then replace(bpi_daca_ldays,'{','0') when right(bpi_daca_ldays,1) = 'A' then replace(bpi_daca_ldays,'A','1')
+when right(bpi_daca_ldays,1) = 'B' then replace(bpi_daca_ldays,'B','2') when right(bpi_daca_ldays,1) = 'C' then replace(bpi_daca_ldays,'C','3')
+when right(bpi_daca_ldays,1) = 'D' then replace(bpi_daca_ldays,'D','4') when right(bpi_daca_ldays,1) = 'E' then replace(bpi_daca_ldays,'E','5')
+when right(bpi_daca_ldays,1) = 'F' then replace(bpi_daca_ldays,'F','6') when right(bpi_daca_ldays,1) = 'G' then replace(bpi_daca_ldays,'G','7')
+when right(bpi_daca_ldays,1) = 'H' then replace(bpi_daca_ldays,'H','8') when right(bpi_daca_ldays,1) = 'I' then replace(bpi_daca_ldays,'I','9')
+when right(bpi_daca_ldays,1) = '}' then replace('-'+bpi_daca_ldays,'}','0') when right(bpi_daca_ldays,1) = 'J' then replace('-'+bpi_daca_ldays,'J','1')
+when right(bpi_daca_ldays,1) = 'K' then replace('-'+bpi_daca_ldays,'K','2') when right(bpi_daca_ldays,1) = 'L' then replace('-'+bpi_daca_ldays,'L','3')
+when right(bpi_daca_ldays,1) = 'M' then replace('-'+bpi_daca_ldays,'M','4') when right(bpi_daca_ldays,1) = 'N' then replace('-'+bpi_daca_ldays,'N','5')
+when right(bpi_daca_ldays,1) = 'O' then replace('-'+bpi_daca_ldays,'O','6') when right(bpi_daca_ldays,1) = 'P' then replace('-'+bpi_daca_ldays,'P','7')
+when right(bpi_daca_ldays,1) = 'Q' then replace('-'+bpi_daca_ldays,'Q','8') when right(bpi_daca_ldays,1) = 'R' then replace('-'+bpi_daca_ldays,'R','9')
+else bpi_daca_ldays end as int) bpi_daca_ldays,cast(bpi_daca_leval_hrs as int)*.01 bpi_daca_leval_hrs, 
+cast(case 
+when right(bpi_daca_wdays,1) = '{' then replace(bpi_daca_wdays,'{','0') when right(bpi_daca_wdays,1) = 'A' then replace(bpi_daca_wdays,'A','1')
+when right(bpi_daca_wdays,1) = 'B' then replace(bpi_daca_wdays,'B','2') when right(bpi_daca_wdays,1) = 'C' then replace(bpi_daca_wdays,'C','3')
+when right(bpi_daca_wdays,1) = 'D' then replace(bpi_daca_wdays,'D','4') when right(bpi_daca_wdays,1) = 'E' then replace(bpi_daca_wdays,'E','5')
+when right(bpi_daca_wdays,1) = 'F' then replace(bpi_daca_wdays,'F','6') when right(bpi_daca_wdays,1) = 'G' then replace(bpi_daca_wdays,'G','7')
+when right(bpi_daca_wdays,1) = 'H' then replace(bpi_daca_wdays,'H','8') when right(bpi_daca_wdays,1) = 'I' then replace(bpi_daca_wdays,'I','9')
+when right(bpi_daca_wdays,1) = '}' then replace('-'+bpi_daca_wdays,'}','0') when right(bpi_daca_wdays,1) = 'J' then replace('-'+bpi_daca_wdays,'J','1')
+when right(bpi_daca_wdays,1) = 'K' then replace('-'+bpi_daca_wdays,'K','2') when right(bpi_daca_wdays,1) = 'L' then replace('-'+bpi_daca_wdays,'L','3')
+when right(bpi_daca_wdays,1) = 'M' then replace('-'+bpi_daca_wdays,'M','4') when right(bpi_daca_wdays,1) = 'N' then replace('-'+bpi_daca_wdays,'N','5')
+when right(bpi_daca_wdays,1) = 'O' then replace('-'+bpi_daca_wdays,'O','6') when right(bpi_daca_wdays,1) = 'P' then replace('-'+bpi_daca_wdays,'P','7')
+when right(bpi_daca_wdays,1) = 'Q' then replace('-'+bpi_daca_wdays,'Q','8') when right(bpi_daca_wdays,1) = 'R' then replace('-'+bpi_daca_wdays,'R','9')
+else bpi_daca_wdays end as int) bpi_daca_wdays,
+cast(bpi_daca_weval_hrs as int)*.01 bpi_daca_weval_hrs, 
+cast(case 
+when right(bpi_daca_ydays,1) = '{' then replace(bpi_daca_ydays,'{','0') when right(bpi_daca_ydays,1) = 'A' then replace(bpi_daca_ydays,'A','1')
+when right(bpi_daca_ydays,1) = 'B' then replace(bpi_daca_ydays,'B','2') when right(bpi_daca_ydays,1) = 'C' then replace(bpi_daca_ydays,'C','3')
+when right(bpi_daca_ydays,1) = 'D' then replace(bpi_daca_ydays,'D','4') when right(bpi_daca_ydays,1) = 'E' then replace(bpi_daca_ydays,'E','5')
+when right(bpi_daca_ydays,1) = 'F' then replace(bpi_daca_ydays,'F','6') when right(bpi_daca_ydays,1) = 'G' then replace(bpi_daca_ydays,'G','7')
+when right(bpi_daca_ydays,1) = 'H' then replace(bpi_daca_ydays,'H','8') when right(bpi_daca_ydays,1) = 'I' then replace(bpi_daca_ydays,'I','9')
+when right(bpi_daca_ydays,1) = '}' then replace('-'+bpi_daca_ydays,'}','0') when right(bpi_daca_ydays,1) = 'J' then replace('-'+bpi_daca_ydays,'J','1')
+when right(bpi_daca_ydays,1) = 'K' then replace('-'+bpi_daca_ydays,'K','2') when right(bpi_daca_ydays,1) = 'L' then replace('-'+bpi_daca_ydays,'L','3')
+when right(bpi_daca_ydays,1) = 'M' then replace('-'+bpi_daca_ydays,'M','4') when right(bpi_daca_ydays,1) = 'N' then replace('-'+bpi_daca_ydays,'N','5')
+when right(bpi_daca_ydays,1) = 'O' then replace('-'+bpi_daca_ydays,'O','6') when right(bpi_daca_ydays,1) = 'P' then replace('-'+bpi_daca_ydays,'P','7')
+when right(bpi_daca_ydays,1) = 'Q' then replace('-'+bpi_daca_ydays,'Q','8') when right(bpi_daca_ydays,1) = 'R' then replace('-'+bpi_daca_ydays,'R','9')
+else bpi_daca_ydays end as int) bpi_daca_ydays,
+cast(bpi_daca_yeval_hrs as int)*.01 bpi_daca_yeval_hrs,
+cast(bpi_sec_trip_min as int) bpi_sec_trip_min,
+
+cast(case 
+    when right(bpi_reg_rte_992_hrs_wwl,1) = '{' then replace(bpi_reg_rte_992_hrs_wwl,'{','0') when right(bpi_reg_rte_992_hrs_wwl,1) = 'A' then replace(bpi_reg_rte_992_hrs_wwl,'A','1')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'B' then replace(bpi_reg_rte_992_hrs_wwl,'B','2') when right(bpi_reg_rte_992_hrs_wwl,1) = 'C' then replace(bpi_reg_rte_992_hrs_wwl,'C','3')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'D' then replace(bpi_reg_rte_992_hrs_wwl,'D','4') when right(bpi_reg_rte_992_hrs_wwl,1) = 'E' then replace(bpi_reg_rte_992_hrs_wwl,'E','5')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'F' then replace(bpi_reg_rte_992_hrs_wwl,'F','6') when right(bpi_reg_rte_992_hrs_wwl,1) = 'G' then replace(bpi_reg_rte_992_hrs_wwl,'G','7')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'H' then replace(bpi_reg_rte_992_hrs_wwl,'H','8') when right(bpi_reg_rte_992_hrs_wwl,1) = 'I' then replace(bpi_reg_rte_992_hrs_wwl,'I','9')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = '}' then replace('-'+bpi_reg_rte_992_hrs_wwl,'}','0') when right(bpi_reg_rte_992_hrs_wwl,1) = 'J' then replace('-'+bpi_reg_rte_992_hrs_wwl,'J','1')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'K' then replace('-'+bpi_reg_rte_992_hrs_wwl,'K','2') when right(bpi_reg_rte_992_hrs_wwl,1) = 'L' then replace('-'+bpi_reg_rte_992_hrs_wwl,'L','3')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'M' then replace('-'+bpi_reg_rte_992_hrs_wwl,'M','4') when right(bpi_reg_rte_992_hrs_wwl,1) = 'N' then replace('-'+bpi_reg_rte_992_hrs_wwl,'N','5')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'O' then replace('-'+bpi_reg_rte_992_hrs_wwl,'O','6') when right(bpi_reg_rte_992_hrs_wwl,1) = 'P' then replace('-'+bpi_reg_rte_992_hrs_wwl,'P','7')
+    when right(bpi_reg_rte_992_hrs_wwl,1) = 'Q' then replace('-'+bpi_reg_rte_992_hrs_wwl,'Q','8') when right(bpi_reg_rte_992_hrs_wwl,1) = 'R' then replace('-'+bpi_reg_rte_992_hrs_wwl,'R','9')
+    else bpi_reg_rte_992_hrs_wwl end as int) bpi_reg_rte_992_hrs_wwl,
+
+cast(case 
+    when right(bpi_reg_rte_992_hrs_covid,1) = '{' then replace(bpi_reg_rte_992_hrs_covid,'{','0') when right(bpi_reg_rte_992_hrs_covid,1) = 'A' then replace(bpi_reg_rte_992_hrs_covid,'A','1')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'B' then replace(bpi_reg_rte_992_hrs_covid,'B','2') when right(bpi_reg_rte_992_hrs_covid,1) = 'C' then replace(bpi_reg_rte_992_hrs_covid,'C','3')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'D' then replace(bpi_reg_rte_992_hrs_covid,'D','4') when right(bpi_reg_rte_992_hrs_covid,1) = 'E' then replace(bpi_reg_rte_992_hrs_covid,'E','5')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'F' then replace(bpi_reg_rte_992_hrs_covid,'F','6') when right(bpi_reg_rte_992_hrs_covid,1) = 'G' then replace(bpi_reg_rte_992_hrs_covid,'G','7')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'H' then replace(bpi_reg_rte_992_hrs_covid,'H','8') when right(bpi_reg_rte_992_hrs_covid,1) = 'I' then replace(bpi_reg_rte_992_hrs_covid,'I','9')
+    when right(bpi_reg_rte_992_hrs_covid,1) = '}' then replace('-'+bpi_reg_rte_992_hrs_covid,'}','0') when right(bpi_reg_rte_992_hrs_covid,1) = 'J' then replace('-'+bpi_reg_rte_992_hrs_covid,'J','1')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'K' then replace('-'+bpi_reg_rte_992_hrs_covid,'K','2') when right(bpi_reg_rte_992_hrs_covid,1) = 'L' then replace('-'+bpi_reg_rte_992_hrs_covid,'L','3')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'M' then replace('-'+bpi_reg_rte_992_hrs_covid,'M','4') when right(bpi_reg_rte_992_hrs_covid,1) = 'N' then replace('-'+bpi_reg_rte_992_hrs_covid,'N','5')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'O' then replace('-'+bpi_reg_rte_992_hrs_covid,'O','6') when right(bpi_reg_rte_992_hrs_covid,1) = 'P' then replace('-'+bpi_reg_rte_992_hrs_covid,'P','7')
+    when right(bpi_reg_rte_992_hrs_covid,1) = 'Q' then replace('-'+bpi_reg_rte_992_hrs_covid,'Q','8') when right(bpi_reg_rte_992_hrs_covid,1) = 'R' then replace('-'+bpi_reg_rte_992_hrs_covid,'R','9')
+    else bpi_reg_rte_992_hrs_covid end as int) bpi_reg_rte_992_hrs_covid,
+
+cast(case 
+    when right(bpi_daca_7days,1) = '{' then replace(bpi_daca_7days,'{','0') when right(bpi_daca_7days,1) = 'A' then replace(bpi_daca_7days,'A','1')
+    when right(bpi_daca_7days,1) = 'B' then replace(bpi_daca_7days,'B','2') when right(bpi_daca_7days,1) = 'C' then replace(bpi_daca_7days,'C','3')
+    when right(bpi_daca_7days,1) = 'D' then replace(bpi_daca_7days,'D','4') when right(bpi_daca_7days,1) = 'E' then replace(bpi_daca_7days,'E','5')
+    when right(bpi_daca_7days,1) = 'F' then replace(bpi_daca_7days,'F','6') when right(bpi_daca_7days,1) = 'G' then replace(bpi_daca_7days,'G','7')
+    when right(bpi_daca_7days,1) = 'H' then replace(bpi_daca_7days,'H','8') when right(bpi_daca_7days,1) = 'I' then replace(bpi_daca_7days,'I','9')
+    when right(bpi_daca_7days,1) = '}' then replace('-'+bpi_daca_7days,'}','0') when right(bpi_daca_7days,1) = 'J' then replace('-'+bpi_daca_7days,'J','1')
+    when right(bpi_daca_7days,1) = 'K' then replace('-'+bpi_daca_7days,'K','2') when right(bpi_daca_7days,1) = 'L' then replace('-'+bpi_daca_7days,'L','3')
+    when right(bpi_daca_7days,1) = 'M' then replace('-'+bpi_daca_7days,'M','4') when right(bpi_daca_7days,1) = 'N' then replace('-'+bpi_daca_7days,'N','5')
+    when right(bpi_daca_7days,1) = 'O' then replace('-'+bpi_daca_7days,'O','6') when right(bpi_daca_7days,1) = 'P' then replace('-'+bpi_daca_7days,'P','7')
+    when right(bpi_daca_7days,1) = 'Q' then replace('-'+bpi_daca_7days,'Q','8') when right(bpi_daca_7days,1) = 'R' then replace('-'+bpi_daca_7days,'R','9')
+    else bpi_daca_7days end as int) bpi_daca_7days,
+cast(bpi_daca_7eval_hrs as int)*.01 bpi_daca_7eval_hrs, 
+
+cast(case 
+    when right(bpi_daca_8days,1) = '{' then replace(bpi_daca_8days,'{','0') when right(bpi_daca_8days,1) = 'A' then replace(bpi_daca_8days,'A','1')
+    when right(bpi_daca_8days,1) = 'B' then replace(bpi_daca_8days,'B','2') when right(bpi_daca_8days,1) = 'C' then replace(bpi_daca_8days,'C','3')
+    when right(bpi_daca_8days,1) = 'D' then replace(bpi_daca_8days,'D','4') when right(bpi_daca_8days,1) = 'E' then replace(bpi_daca_8days,'E','5')
+    when right(bpi_daca_8days,1) = 'F' then replace(bpi_daca_8days,'F','6') when right(bpi_daca_8days,1) = 'G' then replace(bpi_daca_8days,'G','7')
+    when right(bpi_daca_8days,1) = 'H' then replace(bpi_daca_8days,'H','8') when right(bpi_daca_8days,1) = 'I' then replace(bpi_daca_8days,'I','9')
+    when right(bpi_daca_8days,1) = '}' then replace('-'+bpi_daca_8days,'}','0') when right(bpi_daca_8days,1) = 'J' then replace('-'+bpi_daca_8days,'J','1')
+    when right(bpi_daca_8days,1) = 'K' then replace('-'+bpi_daca_8days,'K','2') when right(bpi_daca_8days,1) = 'L' then replace('-'+bpi_daca_8days,'L','3')
+    when right(bpi_daca_8days,1) = 'M' then replace('-'+bpi_daca_8days,'M','4') when right(bpi_daca_8days,1) = 'N' then replace('-'+bpi_daca_8days,'N','5')
+    when right(bpi_daca_8days,1) = 'O' then replace('-'+bpi_daca_8days,'O','6') when right(bpi_daca_8days,1) = 'P' then replace('-'+bpi_daca_8days,'P','7')
+    when right(bpi_daca_8days,1) = 'Q' then replace('-'+bpi_daca_8days,'Q','8') when right(bpi_daca_8days,1) = 'R' then replace('-'+bpi_daca_8days,'R','9')
+    else bpi_daca_8days end as int) bpi_daca_8days,
+cast(bpi_daca_8eval_hrs as int)*.01 bpi_daca_8eval_hrs, 
+
+cast(case 
+    when right(bpi_daca_9days,1) = '{' then replace(bpi_daca_9days,'{','0') when right(bpi_daca_9days,1) = 'A' then replace(bpi_daca_9days,'A','1')
+    when right(bpi_daca_9days,1) = 'B' then replace(bpi_daca_9days,'B','2') when right(bpi_daca_9days,1) = 'C' then replace(bpi_daca_9days,'C','3')
+    when right(bpi_daca_9days,1) = 'D' then replace(bpi_daca_9days,'D','4') when right(bpi_daca_9days,1) = 'E' then replace(bpi_daca_9days,'E','5')
+    when right(bpi_daca_9days,1) = 'F' then replace(bpi_daca_9days,'F','6') when right(bpi_daca_9days,1) = 'G' then replace(bpi_daca_9days,'G','7')
+    when right(bpi_daca_9days,1) = 'H' then replace(bpi_daca_9days,'H','8') when right(bpi_daca_9days,1) = 'I' then replace(bpi_daca_9days,'I','9')
+    when right(bpi_daca_9days,1) = '}' then replace('-'+bpi_daca_9days,'}','0') when right(bpi_daca_9days,1) = 'J' then replace('-'+bpi_daca_9days,'J','1')
+    when right(bpi_daca_9days,1) = 'K' then replace('-'+bpi_daca_9days,'K','2') when right(bpi_daca_9days,1) = 'L' then replace('-'+bpi_daca_9days,'L','3')
+    when right(bpi_daca_9days,1) = 'M' then replace('-'+bpi_daca_9days,'M','4') when right(bpi_daca_9days,1) = 'N' then replace('-'+bpi_daca_9days,'N','5')
+    when right(bpi_daca_9days,1) = 'O' then replace('-'+bpi_daca_9days,'O','6') when right(bpi_daca_9days,1) = 'P' then replace('-'+bpi_daca_9days,'P','7')
+    when right(bpi_daca_9days,1) = 'Q' then replace('-'+bpi_daca_9days,'Q','8') when right(bpi_daca_9days,1) = 'R' then replace('-'+bpi_daca_9days,'R','9')
+    else bpi_daca_9days end as int) bpi_daca_9days,
+cast(bpi_daca_9eval_hrs as int)*.01 bpi_daca_9eval_hrs
+from RDV_DW.dbo.import_BPIOUT with(nolock) 
+where (((bpi_fy*100)+bpi_pp)*10)+bpi_wk not in (select (((bpi_fypp*100)+bpi_pp)*10)+bpi_wkpp 
+                                                from RDV_DW.dbo.bpi_out with(nolock) 
+                                                group by bpi_fypp,bpi_pp,bpi_wkpp);
+
+update RDV_DW.dbo.bpi_out 
+set bpi_fy = cal_fy_long, bpi_wk = cal_fy_wk 
+from pcdv_dw.dbo.master_calendar with(nolock)
+where cal_yr_pp = bpi_fypp 
+and cal_pp_nbr = bpi_pp 
+and cal_pp_wk = bpi_wkpp 
+and bpi_fy is null;
+
+-- 092114 GDW  Added "RTE-991-HOURS" support new in BPIOUT file (Number of Hours Worked, Sunday
+-- Package Delivery" (between existing RTE-OT-HOURS-FLSAA and REG-RTE-997-HOURS)
+insert into RDV_DW.dbo.hold_bpi_out (
+     bpi_fin_nbr
+    ,bpi_fy
+    ,bpi_pp
+    ,bpi_wk
+    ,bpi_rte
+    ,bpi_code_52_hrs
+    ,bpi_ltats_wrk_hrs
+    ,bpi_ltats_ot_hrs
+    ,bpi_daca_xdays
+    ,bpi_daca_xeval_hrs
+    ,bpi_dat_fdays
+    ,bpi_dat_feval_hrs
+    ,bpi_aux_asst_trn_hrs
+    ,bpi_daca_tdays
+    ,bpi_daca_teval_hrs
+    ,bpi_daca_adays
+    ,bpi_daca_aeval_hrs
+    ,bpi_daca_odays
+    ,bpi_daca_oeval_hrs
+    ,bpi_daca_rdays
+    ,bpi_daca_reval_hrs
+    ,bpi_daca_3days
+    ,bpi_daca_3eval_hrs
+    ,bpi_daca_5days
+    ,bpi_daca_5eval_hrs
+    ,bpi_mile_dev
+    ,bpi_aux_rte_ovr40_hrs
+    ,bpi_aux_assit_hrs
+    ,bpi_reg_rte_ot_hrs_flsab
+    ,bpi_reg_rte_ot_hrs_flsaa
+    ,bpi_reg_rte_991_hrs
+    ,bpi_reg_rte_995_hrs
+    ,bpi_reg_rte_996_hrs
+    ,bpi_reg_rte_997_hrs
+    ,bpi_reg_rte_998_hrs
+    ,bpi_reg_rte_999_hrs
+    ,bpi_daca_xday_bal
+    ,bpi_daca_sdays
+    ,bpi_daca_seval_hrs
+    ,bpi_daca_edays
+    ,bpi_daca_eeval_hrs
+    ,bpi_daca_pdays
+    ,bpi_daca_peval_hrs
+    ,bpi_code_53_hrs
+    ,bpi_daca_bdays
+    ,bpi_daca_beval_hrs
+    ,bpi_daca_cdays
+    ,bpi_daca_ceval_hrs
+    ,bpi_daca_ldays
+    ,bpi_daca_leval_hrs
+    ,bpi_daca_wdays
+    ,bpi_daca_weval_hrs
+    ,bpi_daca_ydays
+    ,bpi_daca_yeval_hrs
+    ,bpi_sec_trip_min
+    ,bpi_reg_rte_992_hrs_wwl
+    ,bpi_reg_rte_992_hrs_covid
+    ,bpi_daca_7days
+    ,bpi_daca_7eval_hrs
+    ,bpi_daca_8days
+    ,bpi_daca_8eval_hrs
+    ,bpi_daca_9days
+    ,bpi_daca_9eval_hrs)
+select bpi_fin_nbr
+    ,bpi_fy
+    ,bpi_pp
+    ,bpi_wk
+    ,count(bpi_rte) bpi_rte
+    ,sum(bpi_code_52_hrs) bpi_code_52_hrs
+    ,sum(bpi_ltats_wrk_hrs) bpi_ltats_wrk_hrs
+    ,sum(bpi_ltats_ot_hrs) bpi_ltats_ot_hrs
+    ,sum(bpi_daca_xdays) bpi_daca_xdays
+    ,sum(bpi_daca_xeval_hrs) bpi_daca_xeval_hrs
+    ,sum(bpi_dat_fdays) bpi_dat_fdays
+    ,sum(bpi_dat_feval_hrs) bpi_dat_feval_hrs
+    ,sum(bpi_aux_asst_trn_hrs) bpi_aux_asst_trn_hrs
+    ,sum(bpi_daca_tdays) bpi_daca_tdays
+    ,sum(bpi_daca_teval_hrs) bpi_daca_teval_hrs
+    ,sum(bpi_daca_adays) bpi_daca_adays
+    ,sum(bpi_daca_aeval_hrs) bpi_daca_aeval_hrs
+    ,sum(bpi_daca_odays) bpi_daca_odays
+    ,sum(bpi_daca_oeval_hrs) bpi_daca_oeval_hrs
+    ,sum(bpi_daca_rdays) bpi_daca_rdays
+    ,sum(bpi_daca_reval_hrs) bpi_daca_reval_hrs
+    ,sum(bpi_daca_3days) bpi_daca_3days
+    ,sum(bpi_daca_3eval_hrs) bpi_daca_3eval_hrs
+    ,sum(bpi_daca_5days) bpi_daca_5days
+    ,sum(bpi_daca_5eval_hrs) bpi_daca_5eval_hrs
+    ,sum(bpi_mile_dev) bpi_mile_dev
+    ,sum(bpi_aux_rte_ovr40_hrs) bpi_aux_rte_ovr40_hrs
+    ,sum(bpi_aux_assit_hrs) bpi_aux_assit_hrs
+    ,sum(bpi_reg_rte_ot_hrs_flsab) bpi_reg_rte_ot_hrs_flsab
+    ,sum(bpi_reg_rte_ot_hrs_flsaa) bpi_reg_rte_ot_hrs_flsaa
+    --  092114 GDW  Added "RTE-991-HOURS" support new in BPIOUT file (Number of Hours Worked
+    -- Sunday Package Delivery" (between existing RTE-OT-HOURS-FLSAA and REG-RTE-997-HOURS)
+    ,sum(bpi_reg_rte_991_hrs) bpi_reg_rte_991_hrs
+    -- 081415  GDW  Added "RTE-995-HOURS" and "RTE-996-HOURS" to accommodate newly expanded BPIOUT file
+    ,sum(bpi_reg_rte_995_hrs) bpi_reg_rte_995_hrs
+    ,sum(bpi_reg_rte_996_hrs) bpi_reg_rte_996_hrs
+    ,sum(bpi_reg_rte_997_hrs) bpi_reg_rte_997_hrs
+    ,sum(bpi_reg_rte_998_hrs) bpi_reg_rte_998_hrs
+    ,sum(bpi_reg_rte_999_hrs) bpi_reg_rte_999_hrs
+    ,sum(bpi_daca_xday_bal) bpi_daca_xday_bal
+    ,sum(bpi_daca_sdays) bpi_daca_sdays
+    ,sum(bpi_daca_seval_hrs) bpi_daca_seval_hrs
+    ,sum(bpi_daca_edays) bpi_daca_edays
+    ,sum(bpi_daca_eeval_hrs) bpi_daca_eeval_hrs
+    ,sum(bpi_daca_pdays) bpi_daca_pdays
+    ,sum(bpi_daca_peval_hrs) bpi_daca_peval_hrs
+    ,sum(bpi_code_53_hrs) bpi_code_53_hrs
+    ,sum(bpi_daca_bdays) bpi_daca_bdays
+    ,sum(bpi_daca_beval_hrs) bpi_daca_beval_hrs
+    ,sum(bpi_daca_cdays) bpi_daca_cdays
+    ,sum(bpi_daca_ceval_hrs) bpi_daca_ceval_hrs
+    ,sum(bpi_daca_ldays) bpi_daca_ldays
+    ,sum(bpi_daca_leval_hrs) bpi_daca_leval_hrs
+    ,sum(bpi_daca_wdays) bpi_daca_wdays
+    ,sum(bpi_daca_weval_hrs) bpi_daca_weval_hrs
+    ,sum(bpi_daca_ydays) bpi_daca_ydays
+    ,sum(bpi_daca_yeval_hrs) bpi_daca_yeval_hrs
+    ,sum(bpi_sec_trip_min) bpi_sec_trip_min
+    ,sum(bpi_reg_rte_992_hrs_wwl)bpi_reg_rte_992_hrs_wwl
+    ,sum(bpi_reg_rte_992_hrs_covid) bpi_reg_rte_992_hrs_covid
+    ,sum(bpi_daca_7days) bpi_daca_7days
+    ,sum(bpi_daca_7eval_hrs) bpi_daca_7eval_hrs
+    ,sum(bpi_daca_8days) bpi_daca_8days
+    ,sum(bpi_daca_8eval_hrs) bpi_daca_8eval_hrs
+    ,sum(bpi_daca_9days) bpi_daca_9days
+    ,sum(bpi_daca_9eval_hrs) bpi_daca_9eval_hrs
+from RDV_DW.dbo.bpi_out with(nolock) 
+where (bpi_fy*100)+bpi_wk not in (select (bpi_fy*100)+bpi_wk 
+                                    from RDV_DW.dbo.hold_bpi_out with(nolock) 
+                                    group by bpi_fy,bpi_wk) 
+                                    group by bpi_fin_nbr, bpi_fy, bpi_pp, bpi_wk
+PRINT 'Updating BPI_OUT Done'
+--rural extract update
+PRINT 'Updating Rural Extract'
+
+declare @curfywkpp int;
+
+set @curfywkpp = (select top 1 re_pp_fypp from RDV_DW.dbo.import_rural_extract with(nolock) order by re_pp_fypp desc);
+
+insert into RDV_DW.dbo.rural_extract_out (re_rec_stat, re_fin_nbr, re_rte, re_rec_id, re_rec_seq, re_ba_code_1, re_ba_code_2, re_fdc_no, re_eff_fypp, re_proc_fypp, re_created_date, re_pay_rte_typ, re_rr_pay_rte_typ, re_rte_stat, re_high_low_opt, re_eval_hrs, re_opt_eval_hrs, re_miles, re_stops, re_box_reg, re_box_cent, re_box_factor, re_high_den_rte_code, re_high_den_fypp, re_em_signal, re_rte_dly_em_rte, re_rel_addl_comp_code, re_rot_rel_ind, re_ann_lck_pch_rte, re_rte_len_miles, re_stn_rte_tot_hrs, re_stn_rte_tot_mins, re_rte_120_min_cnt, re_ann_seq_key, re_spc_seq_key, re_int_seq_key, re_rte_typ_beg_natl_agr, re_vac_fil_fypp, re_em_hdrc_fypp, re_chg_fypp, re_potl_fypp, re_mi_hd_fypp, re_tri_wk_code, re_lock_pouch_stps, re_lst_rte_chg_type, re_conv_wk_dis, re_conv_wk_dis_dist, re_conv_bx_reg, re_wk_dis, re_wk_dis_dist, re_detour_route, re_detour_miles, re_sea_rte, re_sea_ppwk, re_in_sea_ind, re_sea_miles, re_sea_bx_reg, re_sea_bx_cent, re_ndcbu_coll_bx, re_par_lockers, re_ret_dev_miles_cnt, re_tran_frm_fin, re_tran_frm_rte, re_tran_to_fin, re_tran_to_rte, re_ext_date, re_pp_fypp)
+select re_rec_stat, re_fin_nbr, re_rte, re_rec_id, re_rec_seq, re_ba_code_1, re_ba_code_2, re_fdc_no, re_eff_fypp, re_proc_fypp, re_created_date, re_pay_rte_typ, re_rr_pay_rte_typ, re_rte_stat, re_high_low_opt, 
+cast(case when right(re_eval_hrs,1) = '{' then replace(re_eval_hrs,'{','0') when right(re_eval_hrs,1) = 'A' then replace(re_eval_hrs,'A','1')
+when right(re_eval_hrs,1) = 'B' then replace(re_eval_hrs,'B','2') when right(re_eval_hrs,1) = 'C' then replace(re_eval_hrs,'C','3')
+when right(re_eval_hrs,1) = 'D' then replace(re_eval_hrs,'D','4') when right(re_eval_hrs,1) = 'E' then replace(re_eval_hrs,'E','5')
+when right(re_eval_hrs,1) = 'F' then replace(re_eval_hrs,'F','6') when right(re_eval_hrs,1) = 'G' then replace(re_eval_hrs,'G','7')
+when right(re_eval_hrs,1) = 'H' then replace(re_eval_hrs,'H','8') when right(re_eval_hrs,1) = 'I' then replace(re_eval_hrs,'I','9')
+when right(re_eval_hrs,1) = '}' then replace('-'+re_eval_hrs,'}','0') when right(re_eval_hrs,1) = 'J' then replace('-'+re_eval_hrs,'J','1')
+when right(re_eval_hrs,1) = 'K' then replace('-'+re_eval_hrs,'K','2') when right(re_eval_hrs,1) = 'L' then replace('-'+re_eval_hrs,'L','3')
+when right(re_eval_hrs,1) = 'M' then replace('-'+re_eval_hrs,'M','4') when right(re_eval_hrs,1) = 'N' then replace('-'+re_eval_hrs,'N','5')
+when right(re_eval_hrs,1) = 'O' then replace('-'+re_eval_hrs,'O','6') when right(re_eval_hrs,1) = 'P' then replace('-'+re_eval_hrs,'P','7')
+when right(re_eval_hrs,1) = 'Q' then replace('-'+re_eval_hrs,'Q','8') when right(re_eval_hrs,1) = 'R' then replace('-'+re_eval_hrs,'R','9')else re_eval_hrs end as int) re_eval_hrs,
+cast(case when right(re_opt_eval_hrs,1) = '{' then replace(re_opt_eval_hrs,'{','0') when right(re_opt_eval_hrs,1) = 'A' then replace(re_opt_eval_hrs,'A','1')
+when right(re_opt_eval_hrs,1) = 'B' then replace(re_opt_eval_hrs,'B','2') when right(re_opt_eval_hrs,1) = 'C' then replace(re_opt_eval_hrs,'C','3')
+when right(re_opt_eval_hrs,1) = 'D' then replace(re_opt_eval_hrs,'D','4') when right(re_opt_eval_hrs,1) = 'E' then replace(re_opt_eval_hrs,'E','5')
+when right(re_opt_eval_hrs,1) = 'F' then replace(re_opt_eval_hrs,'F','6') when right(re_opt_eval_hrs,1) = 'G' then replace(re_opt_eval_hrs,'G','7')
+when right(re_opt_eval_hrs,1) = 'H' then replace(re_opt_eval_hrs,'H','8') when right(re_opt_eval_hrs,1) = 'I' then replace(re_opt_eval_hrs,'I','9')
+when right(re_opt_eval_hrs,1) = '}' then replace('-'+re_opt_eval_hrs,'}','0') when right(re_opt_eval_hrs,1) = 'J' then replace('-'+re_opt_eval_hrs,'J','1')
+when right(re_opt_eval_hrs,1) = 'K' then replace('-'+re_opt_eval_hrs,'K','2') when right(re_opt_eval_hrs,1) = 'L' then replace('-'+re_opt_eval_hrs,'L','3')
+when right(re_opt_eval_hrs,1) = 'M' then replace('-'+re_opt_eval_hrs,'M','4') when right(re_opt_eval_hrs,1) = 'N' then replace('-'+re_opt_eval_hrs,'N','5')
+when right(re_opt_eval_hrs,1) = 'O' then replace('-'+re_opt_eval_hrs,'O','6') when right(re_opt_eval_hrs,1) = 'P' then replace('-'+re_opt_eval_hrs,'P','7')
+when right(re_opt_eval_hrs,1) = 'Q' then replace('-'+re_opt_eval_hrs,'Q','8') when right(re_opt_eval_hrs,1) = 'R' then replace('-'+re_opt_eval_hrs,'R','9')else re_opt_eval_hrs end as int) re_opt_eval_hrs,
+cast(case when right(re_miles,1) = '{' then replace(re_miles,'{','0') when right(re_miles,1) = 'A' then replace(re_miles,'A','1')
+when right(re_miles,1) = 'B' then replace(re_miles,'B','2') when right(re_miles,1) = 'C' then replace(re_miles,'C','3')
+when right(re_miles,1) = 'D' then replace(re_miles,'D','4') when right(re_miles,1) = 'E' then replace(re_miles,'E','5')
+when right(re_miles,1) = 'F' then replace(re_miles,'F','6') when right(re_miles,1) = 'G' then replace(re_miles,'G','7')
+when right(re_miles,1) = 'H' then replace(re_miles,'H','8') when right(re_miles,1) = 'I' then replace(re_miles,'I','9')
+when right(re_miles,1) = '}' then replace('-'+re_miles,'}','0') when right(re_miles,1) = 'J' then replace('-'+re_miles,'J','1')
+when right(re_miles,1) = 'K' then replace('-'+re_miles,'K','2') when right(re_miles,1) = 'L' then replace('-'+re_miles,'L','3')
+when right(re_miles,1) = 'M' then replace('-'+re_miles,'M','4') when right(re_miles,1) = 'N' then replace('-'+re_miles,'N','5')
+when right(re_miles,1) = 'O' then replace('-'+re_miles,'O','6') when right(re_miles,1) = 'P' then replace('-'+re_miles,'P','7')
+when right(re_miles,1) = 'Q' then replace('-'+re_miles,'Q','8') when right(re_miles,1) = 'R' then replace('-'+re_miles,'R','9')else re_miles end as int) re_miles,
+cast(case when right(re_stops,1) = '{' then replace(re_stops,'{','0') when right(re_stops,1) = 'A' then replace(re_stops,'A','1')
+when right(re_stops,1) = 'B' then replace(re_stops,'B','2') when right(re_stops,1) = 'C' then replace(re_stops,'C','3')
+when right(re_stops,1) = 'D' then replace(re_stops,'D','4') when right(re_stops,1) = 'E' then replace(re_stops,'E','5')
+when right(re_stops,1) = 'F' then replace(re_stops,'F','6') when right(re_stops,1) = 'G' then replace(re_stops,'G','7')
+when right(re_stops,1) = 'H' then replace(re_stops,'H','8') when right(re_stops,1) = 'I' then replace(re_stops,'I','9')
+when right(re_stops,1) = '}' then replace('-'+re_stops,'}','0') when right(re_stops,1) = 'J' then replace('-'+re_stops,'J','1')
+when right(re_stops,1) = 'K' then replace('-'+re_stops,'K','2') when right(re_stops,1) = 'L' then replace('-'+re_stops,'L','3')
+when right(re_stops,1) = 'M' then replace('-'+re_stops,'M','4') when right(re_stops,1) = 'N' then replace('-'+re_stops,'N','5')
+when right(re_stops,1) = 'O' then replace('-'+re_stops,'O','6') when right(re_stops,1) = 'P' then replace('-'+re_stops,'P','7')
+when right(re_stops,1) = 'Q' then replace('-'+re_stops,'Q','8') when right(re_stops,1) = 'R' then replace('-'+re_stops,'R','9')else re_stops end as int) re_stops,
+cast(case when right(re_box_reg,1) = '{' then replace(re_box_reg,'{','0') when right(re_box_reg,1) = 'A' then replace(re_box_reg,'A','1')
+when right(re_box_reg,1) = 'B' then replace(re_box_reg,'B','2') when right(re_box_reg,1) = 'C' then replace(re_box_reg,'C','3')
+when right(re_box_reg,1) = 'D' then replace(re_box_reg,'D','4') when right(re_box_reg,1) = 'E' then replace(re_box_reg,'E','5')
+when right(re_box_reg,1) = 'F' then replace(re_box_reg,'F','6') when right(re_box_reg,1) = 'G' then replace(re_box_reg,'G','7')
+when right(re_box_reg,1) = 'H' then replace(re_box_reg,'H','8') when right(re_box_reg,1) = 'I' then replace(re_box_reg,'I','9')
+when right(re_box_reg,1) = '}' then replace('-'+re_box_reg,'}','0') when right(re_box_reg,1) = 'J' then replace('-'+re_box_reg,'J','1')
+when right(re_box_reg,1) = 'K' then replace('-'+re_box_reg,'K','2') when right(re_box_reg,1) = 'L' then replace('-'+re_box_reg,'L','3')
+when right(re_box_reg,1) = 'M' then replace('-'+re_box_reg,'M','4') when right(re_box_reg,1) = 'N' then replace('-'+re_box_reg,'N','5')
+when right(re_box_reg,1) = 'O' then replace('-'+re_box_reg,'O','6') when right(re_box_reg,1) = 'P' then replace('-'+re_box_reg,'P','7')
+when right(re_box_reg,1) = 'Q' then replace('-'+re_box_reg,'Q','8') when right(re_box_reg,1) = 'R' then replace('-'+re_box_reg,'R','9')else re_box_reg end as int) re_box_reg,
+cast(case when right(re_box_cent,1) = '{' then replace(re_box_cent,'{','0') when right(re_box_cent,1) = 'A' then replace(re_box_cent,'A','1')
+when right(re_box_cent,1) = 'B' then replace(re_box_cent,'B','2') when right(re_box_cent,1) = 'C' then replace(re_box_cent,'C','3')
+when right(re_box_cent,1) = 'D' then replace(re_box_cent,'D','4') when right(re_box_cent,1) = 'E' then replace(re_box_cent,'E','5')
+when right(re_box_cent,1) = 'F' then replace(re_box_cent,'F','6') when right(re_box_cent,1) = 'G' then replace(re_box_cent,'G','7')
+when right(re_box_cent,1) = 'H' then replace(re_box_cent,'H','8') when right(re_box_cent,1) = 'I' then replace(re_box_cent,'I','9')
+when right(re_box_cent,1) = '}' then replace('-'+re_box_cent,'}','0') when right(re_box_cent,1) = 'J' then replace('-'+re_box_cent,'J','1')
+when right(re_box_cent,1) = 'K' then replace('-'+re_box_cent,'K','2') when right(re_box_cent,1) = 'L' then replace('-'+re_box_cent,'L','3')
+when right(re_box_cent,1) = 'M' then replace('-'+re_box_cent,'M','4') when right(re_box_cent,1) = 'N' then replace('-'+re_box_cent,'N','5')
+when right(re_box_cent,1) = 'O' then replace('-'+re_box_cent,'O','6') when right(re_box_cent,1) = 'P' then replace('-'+re_box_cent,'P','7')
+when right(re_box_cent,1) = 'Q' then replace('-'+re_box_cent,'Q','8') when right(re_box_cent,1) = 'R' then replace('-'+re_box_cent,'R','9')else re_box_cent end as int) re_box_cent,
+cast(case when right(re_box_factor,1) = '{' then replace(re_box_factor,'{','0') when right(re_box_factor,1) = 'A' then replace(re_box_factor,'A','1')
+when right(re_box_factor,1) = 'B' then replace(re_box_factor,'B','2') when right(re_box_factor,1) = 'C' then replace(re_box_factor,'C','3')
+when right(re_box_factor,1) = 'D' then replace(re_box_factor,'D','4') when right(re_box_factor,1) = 'E' then replace(re_box_factor,'E','5')
+when right(re_box_factor,1) = 'F' then replace(re_box_factor,'F','6') when right(re_box_factor,1) = 'G' then replace(re_box_factor,'G','7')
+when right(re_box_factor,1) = 'H' then replace(re_box_factor,'H','8') when right(re_box_factor,1) = 'I' then replace(re_box_factor,'I','9')
+when right(re_box_factor,1) = '}' then replace('-'+re_box_factor,'}','0') when right(re_box_factor,1) = 'J' then replace('-'+re_box_factor,'J','1')
+when right(re_box_factor,1) = 'K' then replace('-'+re_box_factor,'K','2') when right(re_box_factor,1) = 'L' then replace('-'+re_box_factor,'L','3')
+when right(re_box_factor,1) = 'M' then replace('-'+re_box_factor,'M','4') when right(re_box_factor,1) = 'N' then replace('-'+re_box_factor,'N','5')
+when right(re_box_factor,1) = 'O' then replace('-'+re_box_factor,'O','6') when right(re_box_factor,1) = 'P' then replace('-'+re_box_factor,'P','7')
+when right(re_box_factor,1) = 'Q' then replace('-'+re_box_factor,'Q','8') when right(re_box_factor,1) = 'R' then replace('-'+re_box_factor,'R','9')else re_box_factor end as int)*.01 re_box_factor,
+re_high_den_rte_code, re_high_den_fypp, re_em_signal, 
+cast(case when right(re_rte_dly_em_rte,1) = '{' then replace(re_rte_dly_em_rte,'{','0') when right(re_rte_dly_em_rte,1) = 'A' then replace(re_rte_dly_em_rte,'A','1')
+when right(re_rte_dly_em_rte,1) = 'B' then replace(re_rte_dly_em_rte,'B','2') when right(re_rte_dly_em_rte,1) = 'C' then replace(re_rte_dly_em_rte,'C','3')
+when right(re_rte_dly_em_rte,1) = 'D' then replace(re_rte_dly_em_rte,'D','4') when right(re_rte_dly_em_rte,1) = 'E' then replace(re_rte_dly_em_rte,'E','5')
+when right(re_rte_dly_em_rte,1) = 'F' then replace(re_rte_dly_em_rte,'F','6') when right(re_rte_dly_em_rte,1) = 'G' then replace(re_rte_dly_em_rte,'G','7')
+when right(re_rte_dly_em_rte,1) = 'H' then replace(re_rte_dly_em_rte,'H','8') when right(re_rte_dly_em_rte,1) = 'I' then replace(re_rte_dly_em_rte,'I','9')
+when right(re_rte_dly_em_rte,1) = '}' then replace('-'+re_rte_dly_em_rte,'}','0') when right(re_rte_dly_em_rte,1) = 'J' then replace('-'+re_rte_dly_em_rte,'J','1')
+when right(re_rte_dly_em_rte,1) = 'K' then replace('-'+re_rte_dly_em_rte,'K','2') when right(re_rte_dly_em_rte,1) = 'L' then replace('-'+re_rte_dly_em_rte,'L','3')
+when right(re_rte_dly_em_rte,1) = 'M' then replace('-'+re_rte_dly_em_rte,'M','4') when right(re_rte_dly_em_rte,1) = 'N' then replace('-'+re_rte_dly_em_rte,'N','5')
+when right(re_rte_dly_em_rte,1) = 'O' then replace('-'+re_rte_dly_em_rte,'O','6') when right(re_rte_dly_em_rte,1) = 'P' then replace('-'+re_rte_dly_em_rte,'P','7')
+when right(re_rte_dly_em_rte,1) = 'Q' then replace('-'+re_rte_dly_em_rte,'Q','8') when right(re_rte_dly_em_rte,1) = 'R' then replace('-'+re_rte_dly_em_rte,'R','9')else re_rte_dly_em_rte end as int)*.01 re_rte_dly_em_rte, 
+re_rel_addl_comp_code, re_rot_rel_ind, 
+cast(case when right(re_ann_lck_pch_rte,1) = '{' then replace(re_ann_lck_pch_rte,'{','0') when right(re_ann_lck_pch_rte,1) = 'A' then replace(re_ann_lck_pch_rte,'A','1')
+when right(re_ann_lck_pch_rte,1) = 'B' then replace(re_ann_lck_pch_rte,'B','2') when right(re_ann_lck_pch_rte,1) = 'C' then replace(re_ann_lck_pch_rte,'C','3')
+when right(re_ann_lck_pch_rte,1) = 'D' then replace(re_ann_lck_pch_rte,'D','4') when right(re_ann_lck_pch_rte,1) = 'E' then replace(re_ann_lck_pch_rte,'E','5')
+when right(re_ann_lck_pch_rte,1) = 'F' then replace(re_ann_lck_pch_rte,'F','6') when right(re_ann_lck_pch_rte,1) = 'G' then replace(re_ann_lck_pch_rte,'G','7')
+when right(re_ann_lck_pch_rte,1) = 'H' then replace(re_ann_lck_pch_rte,'H','8') when right(re_ann_lck_pch_rte,1) = 'I' then replace(re_ann_lck_pch_rte,'I','9')
+when right(re_ann_lck_pch_rte,1) = '}' then replace('-'+re_ann_lck_pch_rte,'}','0') when right(re_ann_lck_pch_rte,1) = 'J' then replace('-'+re_ann_lck_pch_rte,'J','1')
+when right(re_ann_lck_pch_rte,1) = 'K' then replace('-'+re_ann_lck_pch_rte,'K','2') when right(re_ann_lck_pch_rte,1) = 'L' then replace('-'+re_ann_lck_pch_rte,'L','3')
+when right(re_ann_lck_pch_rte,1) = 'M' then replace('-'+re_ann_lck_pch_rte,'M','4') when right(re_ann_lck_pch_rte,1) = 'N' then replace('-'+re_ann_lck_pch_rte,'N','5')
+when right(re_ann_lck_pch_rte,1) = 'O' then replace('-'+re_ann_lck_pch_rte,'O','6') when right(re_ann_lck_pch_rte,1) = 'P' then replace('-'+re_ann_lck_pch_rte,'P','7')
+when right(re_ann_lck_pch_rte,1) = 'Q' then replace('-'+re_ann_lck_pch_rte,'Q','8') when right(re_ann_lck_pch_rte,1) = 'R' then replace('-'+re_ann_lck_pch_rte,'R','9')else re_ann_lck_pch_rte end as int)re_ann_lck_pch_rte,
+cast(case when right(re_rte_len_miles,1) = '{' then replace(re_rte_len_miles,'{','0') when right(re_rte_len_miles,1) = 'A' then replace(re_rte_len_miles,'A','1')
+when right(re_rte_len_miles,1) = 'B' then replace(re_rte_len_miles,'B','2') when right(re_rte_len_miles,1) = 'C' then replace(re_rte_len_miles,'C','3')
+when right(re_rte_len_miles,1) = 'D' then replace(re_rte_len_miles,'D','4') when right(re_rte_len_miles,1) = 'E' then replace(re_rte_len_miles,'E','5')
+when right(re_rte_len_miles,1) = 'F' then replace(re_rte_len_miles,'F','6') when right(re_rte_len_miles,1) = 'G' then replace(re_rte_len_miles,'G','7')
+when right(re_rte_len_miles,1) = 'H' then replace(re_rte_len_miles,'H','8') when right(re_rte_len_miles,1) = 'I' then replace(re_rte_len_miles,'I','9')
+when right(re_rte_len_miles,1) = '}' then replace('-'+re_rte_len_miles,'}','0') when right(re_rte_len_miles,1) = 'J' then replace('-'+re_rte_len_miles,'J','1')
+when right(re_rte_len_miles,1) = 'K' then replace('-'+re_rte_len_miles,'K','2') when right(re_rte_len_miles,1) = 'L' then replace('-'+re_rte_len_miles,'L','3')
+when right(re_rte_len_miles,1) = 'M' then replace('-'+re_rte_len_miles,'M','4') when right(re_rte_len_miles,1) = 'N' then replace('-'+re_rte_len_miles,'N','5')
+when right(re_rte_len_miles,1) = 'O' then replace('-'+re_rte_len_miles,'O','6') when right(re_rte_len_miles,1) = 'P' then replace('-'+re_rte_len_miles,'P','7')
+when right(re_rte_len_miles,1) = 'Q' then replace('-'+re_rte_len_miles,'Q','8') when right(re_rte_len_miles,1) = 'R' then replace('-'+re_rte_len_miles,'R','9')else re_rte_len_miles end as int)*.01 re_rte_len_miles,
+cast(case when right(re_stn_rte_tot_hrs,1) = '{' then replace(re_stn_rte_tot_hrs,'{','0') when right(re_stn_rte_tot_hrs,1) = 'A' then replace(re_stn_rte_tot_hrs,'A','1')
+when right(re_stn_rte_tot_hrs,1) = 'B' then replace(re_stn_rte_tot_hrs,'B','2') when right(re_stn_rte_tot_hrs,1) = 'C' then replace(re_stn_rte_tot_hrs,'C','3')
+when right(re_stn_rte_tot_hrs,1) = 'D' then replace(re_stn_rte_tot_hrs,'D','4') when right(re_stn_rte_tot_hrs,1) = 'E' then replace(re_stn_rte_tot_hrs,'E','5')
+when right(re_stn_rte_tot_hrs,1) = 'F' then replace(re_stn_rte_tot_hrs,'F','6') when right(re_stn_rte_tot_hrs,1) = 'G' then replace(re_stn_rte_tot_hrs,'G','7')
+when right(re_stn_rte_tot_hrs,1) = 'H' then replace(re_stn_rte_tot_hrs,'H','8') when right(re_stn_rte_tot_hrs,1) = 'I' then replace(re_stn_rte_tot_hrs,'I','9')
+when right(re_stn_rte_tot_hrs,1) = '}' then replace('-'+re_stn_rte_tot_hrs,'}','0') when right(re_stn_rte_tot_hrs,1) = 'J' then replace('-'+re_stn_rte_tot_hrs,'J','1')
+when right(re_stn_rte_tot_hrs,1) = 'K' then replace('-'+re_stn_rte_tot_hrs,'K','2') when right(re_stn_rte_tot_hrs,1) = 'L' then replace('-'+re_stn_rte_tot_hrs,'L','3')
+when right(re_stn_rte_tot_hrs,1) = 'M' then replace('-'+re_stn_rte_tot_hrs,'M','4') when right(re_stn_rte_tot_hrs,1) = 'N' then replace('-'+re_stn_rte_tot_hrs,'N','5')
+when right(re_stn_rte_tot_hrs,1) = 'O' then replace('-'+re_stn_rte_tot_hrs,'O','6') when right(re_stn_rte_tot_hrs,1) = 'P' then replace('-'+re_stn_rte_tot_hrs,'P','7')
+when right(re_stn_rte_tot_hrs,1) = 'Q' then replace('-'+re_stn_rte_tot_hrs,'Q','8') when right(re_stn_rte_tot_hrs,1) = 'R' then replace('-'+re_stn_rte_tot_hrs,'R','9')else re_stn_rte_tot_hrs end as int)re_stn_rte_tot_hrs,
+cast(case when right(re_stn_rte_tot_mins,1) = '{' then replace(re_stn_rte_tot_mins,'{','0') when right(re_stn_rte_tot_mins,1) = 'A' then replace(re_stn_rte_tot_mins,'A','1')
+when right(re_stn_rte_tot_mins,1) = 'B' then replace(re_stn_rte_tot_mins,'B','2') when right(re_stn_rte_tot_mins,1) = 'C' then replace(re_stn_rte_tot_mins,'C','3')
+when right(re_stn_rte_tot_mins,1) = 'D' then replace(re_stn_rte_tot_mins,'D','4') when right(re_stn_rte_tot_mins,1) = 'E' then replace(re_stn_rte_tot_mins,'E','5')
+when right(re_stn_rte_tot_mins,1) = 'F' then replace(re_stn_rte_tot_mins,'F','6') when right(re_stn_rte_tot_mins,1) = 'G' then replace(re_stn_rte_tot_mins,'G','7')
+when right(re_stn_rte_tot_mins,1) = 'H' then replace(re_stn_rte_tot_mins,'H','8') when right(re_stn_rte_tot_mins,1) = 'I' then replace(re_stn_rte_tot_mins,'I','9')
+when right(re_stn_rte_tot_mins,1) = '}' then replace('-'+re_stn_rte_tot_mins,'}','0') when right(re_stn_rte_tot_mins,1) = 'J' then replace('-'+re_stn_rte_tot_mins,'J','1')
+when right(re_stn_rte_tot_mins,1) = 'K' then replace('-'+re_stn_rte_tot_mins,'K','2') when right(re_stn_rte_tot_mins,1) = 'L' then replace('-'+re_stn_rte_tot_mins,'L','3')
+when right(re_stn_rte_tot_mins,1) = 'M' then replace('-'+re_stn_rte_tot_mins,'M','4') when right(re_stn_rte_tot_mins,1) = 'N' then replace('-'+re_stn_rte_tot_mins,'N','5')
+when right(re_stn_rte_tot_mins,1) = 'O' then replace('-'+re_stn_rte_tot_mins,'O','6') when right(re_stn_rte_tot_mins,1) = 'P' then replace('-'+re_stn_rte_tot_mins,'P','7')
+when right(re_stn_rte_tot_mins,1) = 'Q' then replace('-'+re_stn_rte_tot_mins,'Q','8') when right(re_stn_rte_tot_mins,1) = 'R' then replace('-'+re_stn_rte_tot_mins,'R','9')else re_stn_rte_tot_mins end as int)re_stn_rte_tot_mins,
+cast(case when right(re_rte_120_min_cnt,1) = '{' then replace(re_rte_120_min_cnt,'{','0') when right(re_rte_120_min_cnt,1) = 'A' then replace(re_rte_120_min_cnt,'A','1')
+when right(re_rte_120_min_cnt,1) = 'B' then replace(re_rte_120_min_cnt,'B','2') when right(re_rte_120_min_cnt,1) = 'C' then replace(re_rte_120_min_cnt,'C','3')
+when right(re_rte_120_min_cnt,1) = 'D' then replace(re_rte_120_min_cnt,'D','4') when right(re_rte_120_min_cnt,1) = 'E' then replace(re_rte_120_min_cnt,'E','5')
+when right(re_rte_120_min_cnt,1) = 'F' then replace(re_rte_120_min_cnt,'F','6') when right(re_rte_120_min_cnt,1) = 'G' then replace(re_rte_120_min_cnt,'G','7')
+when right(re_rte_120_min_cnt,1) = 'H' then replace(re_rte_120_min_cnt,'H','8') when right(re_rte_120_min_cnt,1) = 'I' then replace(re_rte_120_min_cnt,'I','9')
+when right(re_rte_120_min_cnt,1) = '}' then replace('-'+re_rte_120_min_cnt,'}','0') when right(re_rte_120_min_cnt,1) = 'J' then replace('-'+re_rte_120_min_cnt,'J','1')
+when right(re_rte_120_min_cnt,1) = 'K' then replace('-'+re_rte_120_min_cnt,'K','2') when right(re_rte_120_min_cnt,1) = 'L' then replace('-'+re_rte_120_min_cnt,'L','3')
+when right(re_rte_120_min_cnt,1) = 'M' then replace('-'+re_rte_120_min_cnt,'M','4') when right(re_rte_120_min_cnt,1) = 'N' then replace('-'+re_rte_120_min_cnt,'N','5')
+when right(re_rte_120_min_cnt,1) = 'O' then replace('-'+re_rte_120_min_cnt,'O','6') when right(re_rte_120_min_cnt,1) = 'P' then replace('-'+re_rte_120_min_cnt,'P','7')
+when right(re_rte_120_min_cnt,1) = 'Q' then replace('-'+re_rte_120_min_cnt,'Q','8') when right(re_rte_120_min_cnt,1) = 'R' then replace('-'+re_rte_120_min_cnt,'R','9')else re_rte_120_min_cnt end as int)re_rte_120_min_cnt,
+re_ann_seq_key, re_spc_seq_key, re_int_seq_key, re_rte_typ_beg_natl_agr, re_vac_fil_fypp, re_em_hdrc_fypp, re_chg_fypp, re_potl_fypp, re_mi_hd_fypp, re_tri_wk_code, 
+cast(case when right(re_lock_pouch_stps,1) = '{' then replace(re_lock_pouch_stps,'{','0') when right(re_lock_pouch_stps,1) = 'A' then replace(re_lock_pouch_stps,'A','1')
+when right(re_lock_pouch_stps,1) = 'B' then replace(re_lock_pouch_stps,'B','2') when right(re_lock_pouch_stps,1) = 'C' then replace(re_lock_pouch_stps,'C','3')
+when right(re_lock_pouch_stps,1) = 'D' then replace(re_lock_pouch_stps,'D','4') when right(re_lock_pouch_stps,1) = 'E' then replace(re_lock_pouch_stps,'E','5')
+when right(re_lock_pouch_stps,1) = 'F' then replace(re_lock_pouch_stps,'F','6') when right(re_lock_pouch_stps,1) = 'G' then replace(re_lock_pouch_stps,'G','7')
+when right(re_lock_pouch_stps,1) = 'H' then replace(re_lock_pouch_stps,'H','8') when right(re_lock_pouch_stps,1) = 'I' then replace(re_lock_pouch_stps,'I','9')
+when right(re_lock_pouch_stps,1) = '}' then replace('-'+re_lock_pouch_stps,'}','0') when right(re_lock_pouch_stps,1) = 'J' then replace('-'+re_lock_pouch_stps,'J','1')
+when right(re_lock_pouch_stps,1) = 'K' then replace('-'+re_lock_pouch_stps,'K','2') when right(re_lock_pouch_stps,1) = 'L' then replace('-'+re_lock_pouch_stps,'L','3')
+when right(re_lock_pouch_stps,1) = 'M' then replace('-'+re_lock_pouch_stps,'M','4') when right(re_lock_pouch_stps,1) = 'N' then replace('-'+re_lock_pouch_stps,'N','5')
+when right(re_lock_pouch_stps,1) = 'O' then replace('-'+re_lock_pouch_stps,'O','6') when right(re_lock_pouch_stps,1) = 'P' then replace('-'+re_lock_pouch_stps,'P','7')
+when right(re_lock_pouch_stps,1) = 'Q' then replace('-'+re_lock_pouch_stps,'Q','8') when right(re_lock_pouch_stps,1) = 'R' then replace('-'+re_lock_pouch_stps,'R','9')else re_lock_pouch_stps end as int)re_lock_pouch_stps,
+re_lst_rte_chg_type, 
+cast(case when right(re_conv_wk_dis,1) = '{' then replace(re_conv_wk_dis,'{','0') when right(re_conv_wk_dis,1) = 'A' then replace(re_conv_wk_dis,'A','1')
+when right(re_conv_wk_dis,1) = 'B' then replace(re_conv_wk_dis,'B','2') when right(re_conv_wk_dis,1) = 'C' then replace(re_conv_wk_dis,'C','3')
+when right(re_conv_wk_dis,1) = 'D' then replace(re_conv_wk_dis,'D','4') when right(re_conv_wk_dis,1) = 'E' then replace(re_conv_wk_dis,'E','5')
+when right(re_conv_wk_dis,1) = 'F' then replace(re_conv_wk_dis,'F','6') when right(re_conv_wk_dis,1) = 'G' then replace(re_conv_wk_dis,'G','7')
+when right(re_conv_wk_dis,1) = 'H' then replace(re_conv_wk_dis,'H','8') when right(re_conv_wk_dis,1) = 'I' then replace(re_conv_wk_dis,'I','9')
+when right(re_conv_wk_dis,1) = '}' then replace('-'+re_conv_wk_dis,'}','0') when right(re_conv_wk_dis,1) = 'J' then replace('-'+re_conv_wk_dis,'J','1')
+when right(re_conv_wk_dis,1) = 'K' then replace('-'+re_conv_wk_dis,'K','2') when right(re_conv_wk_dis,1) = 'L' then replace('-'+re_conv_wk_dis,'L','3')
+when right(re_conv_wk_dis,1) = 'M' then replace('-'+re_conv_wk_dis,'M','4') when right(re_conv_wk_dis,1) = 'N' then replace('-'+re_conv_wk_dis,'N','5')
+when right(re_conv_wk_dis,1) = 'O' then replace('-'+re_conv_wk_dis,'O','6') when right(re_conv_wk_dis,1) = 'P' then replace('-'+re_conv_wk_dis,'P','7')
+when right(re_conv_wk_dis,1) = 'Q' then replace('-'+re_conv_wk_dis,'Q','8') when right(re_conv_wk_dis,1) = 'R' then replace('-'+re_conv_wk_dis,'R','9')else re_conv_wk_dis end as int)re_conv_wk_dis,
+cast(case when right(re_conv_wk_dis_dist,1) = '{' then replace(re_conv_wk_dis_dist,'{','0') when right(re_conv_wk_dis_dist,1) = 'A' then replace(re_conv_wk_dis_dist,'A','1')
+when right(re_conv_wk_dis_dist,1) = 'B' then replace(re_conv_wk_dis_dist,'B','2') when right(re_conv_wk_dis_dist,1) = 'C' then replace(re_conv_wk_dis_dist,'C','3')
+when right(re_conv_wk_dis_dist,1) = 'D' then replace(re_conv_wk_dis_dist,'D','4') when right(re_conv_wk_dis_dist,1) = 'E' then replace(re_conv_wk_dis_dist,'E','5')
+when right(re_conv_wk_dis_dist,1) = 'F' then replace(re_conv_wk_dis_dist,'F','6') when right(re_conv_wk_dis_dist,1) = 'G' then replace(re_conv_wk_dis_dist,'G','7')
+when right(re_conv_wk_dis_dist,1) = 'H' then replace(re_conv_wk_dis_dist,'H','8') when right(re_conv_wk_dis_dist,1) = 'I' then replace(re_conv_wk_dis_dist,'I','9')
+when right(re_conv_wk_dis_dist,1) = '}' then replace('-'+re_conv_wk_dis_dist,'}','0') when right(re_conv_wk_dis_dist,1) = 'J' then replace('-'+re_conv_wk_dis_dist,'J','1')
+when right(re_conv_wk_dis_dist,1) = 'K' then replace('-'+re_conv_wk_dis_dist,'K','2') when right(re_conv_wk_dis_dist,1) = 'L' then replace('-'+re_conv_wk_dis_dist,'L','3')
+when right(re_conv_wk_dis_dist,1) = 'M' then replace('-'+re_conv_wk_dis_dist,'M','4') when right(re_conv_wk_dis_dist,1) = 'N' then replace('-'+re_conv_wk_dis_dist,'N','5')
+when right(re_conv_wk_dis_dist,1) = 'O' then replace('-'+re_conv_wk_dis_dist,'O','6') when right(re_conv_wk_dis_dist,1) = 'P' then replace('-'+re_conv_wk_dis_dist,'P','7')
+when right(re_conv_wk_dis_dist,1) = 'Q' then replace('-'+re_conv_wk_dis_dist,'Q','8') when right(re_conv_wk_dis_dist,1) = 'R' then replace('-'+re_conv_wk_dis_dist,'R','9')else re_conv_wk_dis_dist end as int)re_conv_wk_dis_dist,
+cast(case when right(re_conv_bx_reg,1) = '{' then replace(re_conv_bx_reg,'{','0') when right(re_conv_bx_reg,1) = 'A' then replace(re_conv_bx_reg,'A','1')
+when right(re_conv_bx_reg,1) = 'B' then replace(re_conv_bx_reg,'B','2') when right(re_conv_bx_reg,1) = 'C' then replace(re_conv_bx_reg,'C','3')
+when right(re_conv_bx_reg,1) = 'D' then replace(re_conv_bx_reg,'D','4') when right(re_conv_bx_reg,1) = 'E' then replace(re_conv_bx_reg,'E','5')
+when right(re_conv_bx_reg,1) = 'F' then replace(re_conv_bx_reg,'F','6') when right(re_conv_bx_reg,1) = 'G' then replace(re_conv_bx_reg,'G','7')
+when right(re_conv_bx_reg,1) = 'H' then replace(re_conv_bx_reg,'H','8') when right(re_conv_bx_reg,1) = 'I' then replace(re_conv_bx_reg,'I','9')
+when right(re_conv_bx_reg,1) = '}' then replace('-'+re_conv_bx_reg,'}','0') when right(re_conv_bx_reg,1) = 'J' then replace('-'+re_conv_bx_reg,'J','1')
+when right(re_conv_bx_reg,1) = 'K' then replace('-'+re_conv_bx_reg,'K','2') when right(re_conv_bx_reg,1) = 'L' then replace('-'+re_conv_bx_reg,'L','3')
+when right(re_conv_bx_reg,1) = 'M' then replace('-'+re_conv_bx_reg,'M','4') when right(re_conv_bx_reg,1) = 'N' then replace('-'+re_conv_bx_reg,'N','5')
+when right(re_conv_bx_reg,1) = 'O' then replace('-'+re_conv_bx_reg,'O','6') when right(re_conv_bx_reg,1) = 'P' then replace('-'+re_conv_bx_reg,'P','7')
+when right(re_conv_bx_reg,1) = 'Q' then replace('-'+re_conv_bx_reg,'Q','8') when right(re_conv_bx_reg,1) = 'R' then replace('-'+re_conv_bx_reg,'R','9')else re_conv_bx_reg end as int)re_conv_bx_reg,
+cast(case when right(re_wk_dis,1) = '{' then replace(re_wk_dis,'{','0') when right(re_wk_dis,1) = 'A' then replace(re_wk_dis,'A','1')
+when right(re_wk_dis,1) = 'B' then replace(re_wk_dis,'B','2') when right(re_wk_dis,1) = 'C' then replace(re_wk_dis,'C','3')
+when right(re_wk_dis,1) = 'D' then replace(re_wk_dis,'D','4') when right(re_wk_dis,1) = 'E' then replace(re_wk_dis,'E','5')
+when right(re_wk_dis,1) = 'F' then replace(re_wk_dis,'F','6') when right(re_wk_dis,1) = 'G' then replace(re_wk_dis,'G','7')
+when right(re_wk_dis,1) = 'H' then replace(re_wk_dis,'H','8') when right(re_wk_dis,1) = 'I' then replace(re_wk_dis,'I','9')
+when right(re_wk_dis,1) = '}' then replace('-'+re_wk_dis,'}','0') when right(re_wk_dis,1) = 'J' then replace('-'+re_wk_dis,'J','1')
+when right(re_wk_dis,1) = 'K' then replace('-'+re_wk_dis,'K','2') when right(re_wk_dis,1) = 'L' then replace('-'+re_wk_dis,'L','3')
+when right(re_wk_dis,1) = 'M' then replace('-'+re_wk_dis,'M','4') when right(re_wk_dis,1) = 'N' then replace('-'+re_wk_dis,'N','5')
+when right(re_wk_dis,1) = 'O' then replace('-'+re_wk_dis,'O','6') when right(re_wk_dis,1) = 'P' then replace('-'+re_wk_dis,'P','7')
+when right(re_wk_dis,1) = 'Q' then replace('-'+re_wk_dis,'Q','8') when right(re_wk_dis,1) = 'R' then replace('-'+re_wk_dis,'R','9')else re_wk_dis end as int)re_wk_dis,
+cast(case when right(re_wk_dis_dist,1) = '{' then replace(re_wk_dis_dist,'{','0') when right(re_wk_dis_dist,1) = 'A' then replace(re_wk_dis_dist,'A','1')
+when right(re_wk_dis_dist,1) = 'B' then replace(re_wk_dis_dist,'B','2') when right(re_wk_dis_dist,1) = 'C' then replace(re_wk_dis_dist,'C','3')
+when right(re_wk_dis_dist,1) = 'D' then replace(re_wk_dis_dist,'D','4') when right(re_wk_dis_dist,1) = 'E' then replace(re_wk_dis_dist,'E','5')
+when right(re_wk_dis_dist,1) = 'F' then replace(re_wk_dis_dist,'F','6') when right(re_wk_dis_dist,1) = 'G' then replace(re_wk_dis_dist,'G','7')
+when right(re_wk_dis_dist,1) = 'H' then replace(re_wk_dis_dist,'H','8') when right(re_wk_dis_dist,1) = 'I' then replace(re_wk_dis_dist,'I','9')
+when right(re_wk_dis_dist,1) = '}' then replace('-'+re_wk_dis_dist,'}','0') when right(re_wk_dis_dist,1) = 'J' then replace('-'+re_wk_dis_dist,'J','1')
+when right(re_wk_dis_dist,1) = 'K' then replace('-'+re_wk_dis_dist,'K','2') when right(re_wk_dis_dist,1) = 'L' then replace('-'+re_wk_dis_dist,'L','3')
+when right(re_wk_dis_dist,1) = 'M' then replace('-'+re_wk_dis_dist,'M','4') when right(re_wk_dis_dist,1) = 'N' then replace('-'+re_wk_dis_dist,'N','5')
+when right(re_wk_dis_dist,1) = 'O' then replace('-'+re_wk_dis_dist,'O','6') when right(re_wk_dis_dist,1) = 'P' then replace('-'+re_wk_dis_dist,'P','7')
+when right(re_wk_dis_dist,1) = 'Q' then replace('-'+re_wk_dis_dist,'Q','8') when right(re_wk_dis_dist,1) = 'R' then replace('-'+re_wk_dis_dist,'R','9')else re_wk_dis_dist end as int)re_wk_dis_dist,
+re_detour_route, 
+cast(case when right(re_detour_miles,1) = '{' then replace(re_detour_miles,'{','0') when right(re_detour_miles,1) = 'A' then replace(re_detour_miles,'A','1')
+when right(re_detour_miles,1) = 'B' then replace(re_detour_miles,'B','2') when right(re_detour_miles,1) = 'C' then replace(re_detour_miles,'C','3')
+when right(re_detour_miles,1) = 'D' then replace(re_detour_miles,'D','4') when right(re_detour_miles,1) = 'E' then replace(re_detour_miles,'E','5')
+when right(re_detour_miles,1) = 'F' then replace(re_detour_miles,'F','6') when right(re_detour_miles,1) = 'G' then replace(re_detour_miles,'G','7')
+when right(re_detour_miles,1) = 'H' then replace(re_detour_miles,'H','8') when right(re_detour_miles,1) = 'I' then replace(re_detour_miles,'I','9')
+when right(re_detour_miles,1) = '}' then replace('-'+re_detour_miles,'}','0') when right(re_detour_miles,1) = 'J' then replace('-'+re_detour_miles,'J','1')
+when right(re_detour_miles,1) = 'K' then replace('-'+re_detour_miles,'K','2') when right(re_detour_miles,1) = 'L' then replace('-'+re_detour_miles,'L','3')
+when right(re_detour_miles,1) = 'M' then replace('-'+re_detour_miles,'M','4') when right(re_detour_miles,1) = 'N' then replace('-'+re_detour_miles,'N','5')
+when right(re_detour_miles,1) = 'O' then replace('-'+re_detour_miles,'O','6') when right(re_detour_miles,1) = 'P' then replace('-'+re_detour_miles,'P','7')
+when right(re_detour_miles,1) = 'Q' then replace('-'+re_detour_miles,'Q','8') when right(re_detour_miles,1) = 'R' then replace('-'+re_detour_miles,'R','9')else re_detour_miles end as int)*.01 re_detour_miles,
+re_sea_rte, re_sea_ppwk, re_in_sea_ind, 
+cast(case when right(re_sea_miles,1) = '{' then replace(re_sea_miles,'{','0') when right(re_sea_miles,1) = 'A' then replace(re_sea_miles,'A','1')
+when right(re_sea_miles,1) = 'B' then replace(re_sea_miles,'B','2') when right(re_sea_miles,1) = 'C' then replace(re_sea_miles,'C','3')
+when right(re_sea_miles,1) = 'D' then replace(re_sea_miles,'D','4') when right(re_sea_miles,1) = 'E' then replace(re_sea_miles,'E','5')
+when right(re_sea_miles,1) = 'F' then replace(re_sea_miles,'F','6') when right(re_sea_miles,1) = 'G' then replace(re_sea_miles,'G','7')
+when right(re_sea_miles,1) = 'H' then replace(re_sea_miles,'H','8') when right(re_sea_miles,1) = 'I' then replace(re_sea_miles,'I','9')
+when right(re_sea_miles,1) = '}' then replace('-'+re_sea_miles,'}','0') when right(re_sea_miles,1) = 'J' then replace('-'+re_sea_miles,'J','1')
+when right(re_sea_miles,1) = 'K' then replace('-'+re_sea_miles,'K','2') when right(re_sea_miles,1) = 'L' then replace('-'+re_sea_miles,'L','3')
+when right(re_sea_miles,1) = 'M' then replace('-'+re_sea_miles,'M','4') when right(re_sea_miles,1) = 'N' then replace('-'+re_sea_miles,'N','5')
+when right(re_sea_miles,1) = 'O' then replace('-'+re_sea_miles,'O','6') when right(re_sea_miles,1) = 'P' then replace('-'+re_sea_miles,'P','7')
+when right(re_sea_miles,1) = 'Q' then replace('-'+re_sea_miles,'Q','8') when right(re_sea_miles,1) = 'R' then replace('-'+re_sea_miles,'R','9')else re_sea_miles end as int)*.01 re_sea_miles,
+cast(case when right(re_sea_bx_reg,1) = '{' then replace(re_sea_bx_reg,'{','0') when right(re_sea_bx_reg,1) = 'A' then replace(re_sea_bx_reg,'A','1')
+when right(re_sea_bx_reg,1) = 'B' then replace(re_sea_bx_reg,'B','2') when right(re_sea_bx_reg,1) = 'C' then replace(re_sea_bx_reg,'C','3')
+when right(re_sea_bx_reg,1) = 'D' then replace(re_sea_bx_reg,'D','4') when right(re_sea_bx_reg,1) = 'E' then replace(re_sea_bx_reg,'E','5')
+when right(re_sea_bx_reg,1) = 'F' then replace(re_sea_bx_reg,'F','6') when right(re_sea_bx_reg,1) = 'G' then replace(re_sea_bx_reg,'G','7')
+when right(re_sea_bx_reg,1) = 'H' then replace(re_sea_bx_reg,'H','8') when right(re_sea_bx_reg,1) = 'I' then replace(re_sea_bx_reg,'I','9')
+when right(re_sea_bx_reg,1) = '}' then replace('-'+re_sea_bx_reg,'}','0') when right(re_sea_bx_reg,1) = 'J' then replace('-'+re_sea_bx_reg,'J','1')
+when right(re_sea_bx_reg,1) = 'K' then replace('-'+re_sea_bx_reg,'K','2') when right(re_sea_bx_reg,1) = 'L' then replace('-'+re_sea_bx_reg,'L','3')
+when right(re_sea_bx_reg,1) = 'M' then replace('-'+re_sea_bx_reg,'M','4') when right(re_sea_bx_reg,1) = 'N' then replace('-'+re_sea_bx_reg,'N','5')
+when right(re_sea_bx_reg,1) = 'O' then replace('-'+re_sea_bx_reg,'O','6') when right(re_sea_bx_reg,1) = 'P' then replace('-'+re_sea_bx_reg,'P','7')
+when right(re_sea_bx_reg,1) = 'Q' then replace('-'+re_sea_bx_reg,'Q','8') when right(re_sea_bx_reg,1) = 'R' then replace('-'+re_sea_bx_reg,'R','9')else re_sea_bx_reg end as int)re_sea_bx_reg,
+cast(case when right(re_sea_bx_cent,1) = '{' then replace(re_sea_bx_cent,'{','0') when right(re_sea_bx_cent,1) = 'A' then replace(re_sea_bx_cent,'A','1')
+when right(re_sea_bx_cent,1) = 'B' then replace(re_sea_bx_cent,'B','2') when right(re_sea_bx_cent,1) = 'C' then replace(re_sea_bx_cent,'C','3')
+when right(re_sea_bx_cent,1) = 'D' then replace(re_sea_bx_cent,'D','4') when right(re_sea_bx_cent,1) = 'E' then replace(re_sea_bx_cent,'E','5')
+when right(re_sea_bx_cent,1) = 'F' then replace(re_sea_bx_cent,'F','6') when right(re_sea_bx_cent,1) = 'G' then replace(re_sea_bx_cent,'G','7')
+when right(re_sea_bx_cent,1) = 'H' then replace(re_sea_bx_cent,'H','8') when right(re_sea_bx_cent,1) = 'I' then replace(re_sea_bx_cent,'I','9')
+when right(re_sea_bx_cent,1) = '}' then replace('-'+re_sea_bx_cent,'}','0') when right(re_sea_bx_cent,1) = 'J' then replace('-'+re_sea_bx_cent,'J','1')
+when right(re_sea_bx_cent,1) = 'K' then replace('-'+re_sea_bx_cent,'K','2') when right(re_sea_bx_cent,1) = 'L' then replace('-'+re_sea_bx_cent,'L','3')
+when right(re_sea_bx_cent,1) = 'M' then replace('-'+re_sea_bx_cent,'M','4') when right(re_sea_bx_cent,1) = 'N' then replace('-'+re_sea_bx_cent,'N','5')
+when right(re_sea_bx_cent,1) = 'O' then replace('-'+re_sea_bx_cent,'O','6') when right(re_sea_bx_cent,1) = 'P' then replace('-'+re_sea_bx_cent,'P','7')
+when right(re_sea_bx_cent,1) = 'Q' then replace('-'+re_sea_bx_cent,'Q','8') when right(re_sea_bx_cent,1) = 'R' then replace('-'+re_sea_bx_cent,'R','9')else re_sea_bx_cent end as int)re_sea_bx_cent,
+cast(case when right(re_ndcbu_coll_bx,1) = '{' then replace(re_ndcbu_coll_bx,'{','0') when right(re_ndcbu_coll_bx,1) = 'A' then replace(re_ndcbu_coll_bx,'A','1')
+when right(re_ndcbu_coll_bx,1) = 'B' then replace(re_ndcbu_coll_bx,'B','2') when right(re_ndcbu_coll_bx,1) = 'C' then replace(re_ndcbu_coll_bx,'C','3')
+when right(re_ndcbu_coll_bx,1) = 'D' then replace(re_ndcbu_coll_bx,'D','4') when right(re_ndcbu_coll_bx,1) = 'E' then replace(re_ndcbu_coll_bx,'E','5')
+when right(re_ndcbu_coll_bx,1) = 'F' then replace(re_ndcbu_coll_bx,'F','6') when right(re_ndcbu_coll_bx,1) = 'G' then replace(re_ndcbu_coll_bx,'G','7')
+when right(re_ndcbu_coll_bx,1) = 'H' then replace(re_ndcbu_coll_bx,'H','8') when right(re_ndcbu_coll_bx,1) = 'I' then replace(re_ndcbu_coll_bx,'I','9')
+when right(re_ndcbu_coll_bx,1) = '}' then replace('-'+re_ndcbu_coll_bx,'}','0') when right(re_ndcbu_coll_bx,1) = 'J' then replace('-'+re_ndcbu_coll_bx,'J','1')
+when right(re_ndcbu_coll_bx,1) = 'K' then replace('-'+re_ndcbu_coll_bx,'K','2') when right(re_ndcbu_coll_bx,1) = 'L' then replace('-'+re_ndcbu_coll_bx,'L','3')
+when right(re_ndcbu_coll_bx,1) = 'M' then replace('-'+re_ndcbu_coll_bx,'M','4') when right(re_ndcbu_coll_bx,1) = 'N' then replace('-'+re_ndcbu_coll_bx,'N','5')
+when right(re_ndcbu_coll_bx,1) = 'O' then replace('-'+re_ndcbu_coll_bx,'O','6') when right(re_ndcbu_coll_bx,1) = 'P' then replace('-'+re_ndcbu_coll_bx,'P','7')
+when right(re_ndcbu_coll_bx,1) = 'Q' then replace('-'+re_ndcbu_coll_bx,'Q','8') when right(re_ndcbu_coll_bx,1) = 'R' then replace('-'+re_ndcbu_coll_bx,'R','9')else re_ndcbu_coll_bx end as int)re_ndcbu_coll_bx,
+cast(case when right(re_par_lockers,1) = '{' then replace(re_par_lockers,'{','0') when right(re_par_lockers,1) = 'A' then replace(re_par_lockers,'A','1')
+when right(re_par_lockers,1) = 'B' then replace(re_par_lockers,'B','2') when right(re_par_lockers,1) = 'C' then replace(re_par_lockers,'C','3')
+when right(re_par_lockers,1) = 'D' then replace(re_par_lockers,'D','4') when right(re_par_lockers,1) = 'E' then replace(re_par_lockers,'E','5')
+when right(re_par_lockers,1) = 'F' then replace(re_par_lockers,'F','6') when right(re_par_lockers,1) = 'G' then replace(re_par_lockers,'G','7')
+when right(re_par_lockers,1) = 'H' then replace(re_par_lockers,'H','8') when right(re_par_lockers,1) = 'I' then replace(re_par_lockers,'I','9')
+when right(re_par_lockers,1) = '}' then replace('-'+re_par_lockers,'}','0') when right(re_par_lockers,1) = 'J' then replace('-'+re_par_lockers,'J','1')
+when right(re_par_lockers,1) = 'K' then replace('-'+re_par_lockers,'K','2') when right(re_par_lockers,1) = 'L' then replace('-'+re_par_lockers,'L','3')
+when right(re_par_lockers,1) = 'M' then replace('-'+re_par_lockers,'M','4') when right(re_par_lockers,1) = 'N' then replace('-'+re_par_lockers,'N','5')
+when right(re_par_lockers,1) = 'O' then replace('-'+re_par_lockers,'O','6') when right(re_par_lockers,1) = 'P' then replace('-'+re_par_lockers,'P','7')
+when right(re_par_lockers,1) = 'Q' then replace('-'+re_par_lockers,'Q','8') when right(re_par_lockers,1) = 'R' then replace('-'+re_par_lockers,'R','9')else re_par_lockers end as int)re_par_lockers,
+cast(case when right(re_ret_dev_miles_cnt,1) = '{' then replace(re_ret_dev_miles_cnt,'{','0') when right(re_ret_dev_miles_cnt,1) = 'A' then replace(re_ret_dev_miles_cnt,'A','1')
+when right(re_ret_dev_miles_cnt,1) = 'B' then replace(re_ret_dev_miles_cnt,'B','2') when right(re_ret_dev_miles_cnt,1) = 'C' then replace(re_ret_dev_miles_cnt,'C','3')
+when right(re_ret_dev_miles_cnt,1) = 'D' then replace(re_ret_dev_miles_cnt,'D','4') when right(re_ret_dev_miles_cnt,1) = 'E' then replace(re_ret_dev_miles_cnt,'E','5')
+when right(re_ret_dev_miles_cnt,1) = 'F' then replace(re_ret_dev_miles_cnt,'F','6') when right(re_ret_dev_miles_cnt,1) = 'G' then replace(re_ret_dev_miles_cnt,'G','7')
+when right(re_ret_dev_miles_cnt,1) = 'H' then replace(re_ret_dev_miles_cnt,'H','8') when right(re_ret_dev_miles_cnt,1) = 'I' then replace(re_ret_dev_miles_cnt,'I','9')
+when right(re_ret_dev_miles_cnt,1) = '}' then replace('-'+re_ret_dev_miles_cnt,'}','0') when right(re_ret_dev_miles_cnt,1) = 'J' then replace('-'+re_ret_dev_miles_cnt,'J','1')
+when right(re_ret_dev_miles_cnt,1) = 'K' then replace('-'+re_ret_dev_miles_cnt,'K','2') when right(re_ret_dev_miles_cnt,1) = 'L' then replace('-'+re_ret_dev_miles_cnt,'L','3')
+when right(re_ret_dev_miles_cnt,1) = 'M' then replace('-'+re_ret_dev_miles_cnt,'M','4') when right(re_ret_dev_miles_cnt,1) = 'N' then replace('-'+re_ret_dev_miles_cnt,'N','5')
+when right(re_ret_dev_miles_cnt,1) = 'O' then replace('-'+re_ret_dev_miles_cnt,'O','6') when right(re_ret_dev_miles_cnt,1) = 'P' then replace('-'+re_ret_dev_miles_cnt,'P','7')
+when right(re_ret_dev_miles_cnt,1) = 'Q' then replace('-'+re_ret_dev_miles_cnt,'Q','8') when right(re_ret_dev_miles_cnt,1) = 'R' then replace('-'+re_ret_dev_miles_cnt,'R','9')else re_ret_dev_miles_cnt end as int)*.01 re_ret_dev_miles_cnt,
+--  2014-11-05: GDW  Correct "Add One / Subtract One" misaligner ;)  Add One here
+--re_tran_frm_fin, re_tran_frm_rte, re_tran_to_fin, re_tran_to_rte, re_ext_date, re_pp_fypp+1 from RDV_DW.dbo.import_rural_extract where re_pp_fypp = @curfywkpp and re_pp_fypp+1 not in
+re_tran_frm_fin, re_tran_frm_rte, re_tran_to_fin, re_tran_to_rte, re_ext_date, re_pp_fypp from RDV_DW.dbo.import_rural_extract where re_pp_fypp = @curfywkpp and re_pp_fypp+1 not in
+(select re_pp_fypp from RDV_DW.dbo.import_rural_extract with(nolock) group by re_pp_fypp)
+
+-- Leap Pay Period is 27 and a valid PP
+--update RDV_DW.dbo.rural_extract_out set re_pp_fypp = re_pp_fypp+74 where right(re_pp_fypp,2)=27
+update RDV_DW.dbo.rural_extract_out set re_ppfy = left(re_pp_fypp,4),re_ppwk = right(re_pp_fypp,2) where re_ppfy =0
+update RDV_DW.dbo.rural_extract_out set re_fy = cal_fy_long, re_wk = cal_fy_wk from pcdv_dw.dbo.master_calendar with(nolock)
+--  2014-11-05: GDW  Correct "Add One / Subtract One" misaligner ;)  Subtract One Here
+--where cal_yr_pp = re_ppfy and cal_pp_nbr = re_ppwk-1 and cal_pp_wk =2 and re_fy = 0
+where cal_yr_pp = re_ppfy and cal_pp_nbr = re_ppwk and cal_pp_wk =2 and re_fy = 0
+-- update for new re_pp_fypp fix 12.20.2013
+declare @reofy int declare @reowk int
+set @reofy = (select top 1 re_fy from RDV_DW.dbo.rural_extract_out order by re_fy desc)
+set @reowk = (select top 1 re_wk+2 from RDV_DW.dbo.rural_extract_out order by re_fy desc, re_wk desc)
+update RDV_DW.dbo.rural_extract_out set re_fy = @reofy, re_wk = @reowk where re_fy = 0
+
+update RDV.dbo.var_base set b_rdv_ind=1  where b_fin_nbr in 
+(select re_fin_nbr from RDV_DW.dbo.rural_extract_out with(nolock) where re_pp_fypp = @curfywkpp) and b_rdv_ind=0
+PRINT 'Updating Rural Extract Done'
+--Sum8127 update
+PRINT 'Updating Sum8127'
+declare @currfy int
+set @currfy = (select top 1 fy_long from PCDV_DW.dbo.workingdate with(nolock) order by fy_long)
+select sum_fin_nbr fin, sum_rte_num rte, sum(cast(sum_8127_mins as int))minss 
+into #preweek from RDV_DW.dbo.Import_sum8127 where sum_fy = @currfy group by sum_fin_nbr, sum_rte_num
+update RDV_DW.dbo.Import_sum8127 set sum_8127_mins = cast(sum_8127_mins as int)-cast(minss as int) from #preweek
+where fin=sum_fin_nbr and sum_rte_num=rte and sum_fy=0
+drop table #preweek
+select top 1 * into #dteupdte From RDV_DW.dbo.bpi_out with(nolock) order by bpi_fy desc, bpi_wk desc
+update RDV_DW.dbo.Import_sum8127 set sum_ppfy = bpi_fypp, sum_ppwk = bpi_pp, sum_fy = bpi_fy, sum_wk = bpi_wk
+from #dteupdte with(nolock) where sum_fy=0 drop table #dteupdte
+update RDV_DW.dbo.rural_extract_out set re_8127_mins = sum_8127_mins
+from RDV_DW.dbo.Import_sum8127
+where  sum_fin_nbr=re_fin_nbr and sum_rte_num=re_rte and re_ppfy = sum_ppfy and sum_ppwk = re_ppwk and sum_fy = @currfy
+PRINT 'Updating Sum8127 Done'
+--updating var_base and var_weekly
+PRINT 'Var_base and Var_weekly'
+
+/* 2019-01-24 wildgk; abstract F4 server name */
+DECLARE 
+@CATInd BIT,
+@CSVServerName VARCHAR(255);
+
+
+EXECUTE var_servers.dbo.sp_get_db_server_name
+        N'CSV', @ServerName = @CSVServerName OUTPUT;
+
+
+/* old USPS2020
+  SET @SQLCmd = N'
+  insert into rdv.dbo.var_base (
+      b_area,
+      b_area_name,
+      b_cluster,
+      b_cluster_name,
+      b_mpoo,
+      b_lead_fin_nbr,
+      b_lead_name,
+      b_fin_nbr,
+      b_fin_name,
+      b_cag,
+      b_date,
+      b_level,
+      b_zip)
+  select 
+      b_area,
+      b_area_name,
+      b_cluster,
+      b_cluster_name,
+      b_mpoo,
+      b_lead_fin_nbr,
+      b_lead_name,
+      b_fin_nbr,
+      b_fin_name,
+      b_cag,
+      getdate(),
+      b_level,
+      b_zip 
+  from ' + @CSVServerName + '.pcsv_dw.dbo.var_base with (nolock)
+  where b_fin_nbr not in (select b_fin_nbr from rdv.dbo.var_base with(nolock));';
+-- end old USPS2020 */
+
+-- USPS2020 need to insert into var_base_orgs, then update var_base_other
+--/* begin NEW logic
+    if object_id('tempdb..##csv_var_base') is not null begin drop table ##csv_var_base end;
+
+    --get the needed info from csv var_base into a temp table since you will need it twice
+    SET @SQLCmd = '
+    SELECT 
+      b_area,
+      b_area_name,
+      b_cluster,
+      b_cluster_name,
+      b_mpoo,
+      b_lead_fin_nbr,
+      b_lead_name,
+      b_fin_nbr,
+      b_fin_name,
+      b_cag,
+      getdate() b_date,
+      b_level,
+      b_zip
+    INTO ##csv_var_base
+    FROM ' + @CSVServerName + '.pcsv_dw.dbo.var_base WITH (NOLOCK)
+    where b_fin_nbr not in (select b_fin_nbr from rdv.dbo.var_base with(nolock));';
+
+    EXEC(@SQLCmd);
+
+    --insert new fins and org info into var_base_orgs
+    INSERT INTO rdv.dbo.var_base_orgs (
+        b_area,b_area_name,b_cluster,b_cluster_name,b_mpoo,b_lead_fin_nbr,b_lead_name,b_fin_nbr,b_fin_name,
+        b_modified)
+    SELECT 
+        b_area,b_area_name,b_cluster,b_cluster_name,b_mpoo,b_lead_fin_nbr,b_lead_name,b_fin_nbr,b_fin_name,
+        getdate()
+    FROM ##csv_var_base;
+
+    --because var_base_orgs should have a trigger that immediately inserts the new fin in to var_base_other,
+    --we just need to update var_base_other with the remaining columns' new data
+    update t1
+    set t1.b_cag              = t2.b_cag
+      , t1.b_date             = t2.b_date
+      , t1.b_level            = t2.b_level
+      , t1.b_zip              = t2.b_zip
+    from rdv.dbo.var_base_other t1
+      inner join ##csv_var_base t2
+        on t1.b_fin_nbr = t2.b_fin_nbr;
+
+    if object_id('tempdb..##csv_var_base') is not null begin drop table ##csv_var_base end;
+    
+-- End new logic USPS2020 */
+
+declare 
+@crfy int,
+@crwk int,
+@incount int;
+
+set @crfy = (select top 1 fy_long from PCDV_DW.dbo.workingdate with(nolock) order by fy_long);
+set @crwk = (select top 1 wk_num from PCDV_DW.dbo.workingdate with(nolock) order by fy_long,wk_num);
+
+set @incount = 0;
+
+while @incount < 52 begin
+    set @incount = @incount + 1;
+    
+    insert into rdv.dbo.var_weekly (w_fy,w_wk,w_fin_nbr)
+    select @crfy-1,@incount,b_fin_nbr 
+    from rdv.dbo.var_base with(nolock) 
+    where b_fin_nbr not in (select w_fin_nbr from rdv.dbo.var_weekly with(nolock) where w_fy=@crfy-1 and w_wk = @incount);
+end 
+set @incount = 0;
+
+while @incount < @crwk begin
+    set @incount = @incount + 1;
+    
+    insert into rdv.dbo.var_weekly (w_fy,w_wk,w_fin_nbr)
+    select @crfy,@incount,b_fin_nbr 
+    from rdv.dbo.var_base with(nolock) 
+    where b_fin_nbr not in (select w_fin_nbr from rdv.dbo.var_weekly with(nolock) where w_fy=@crfy and w_wk = @incount)
+end
+
+select cal_fy_long,cal_fy_wk,sum(cal_del_days)deldays 
+into #calwork 
+from PCDV_DW.dbo.master_calendar with(nolock) 
+where cal_fy_long between @crfy-1 and @crfy 
+group by cal_fy_long,cal_fy_wk order by cal_fy_long,cal_fy_wk
+
+UPDATE rdv.dbo.var_weekly 
+SET w_del_days = deldays 
+from #calwork
+where w_fy = cal_fy_long 
+and w_wk = cal_fy_wk 
+and w_del_days < 1
+
+drop table #calwork
+
+update RDV.dbo.var_weekly 
+set w_code_52_hrs = bpi_code_52_hrs
+    ,w_ltats_wrk_hrs = bpi_ltats_wrk_hrs
+    ,w_ltats_ot_hrs = bpi_ltats_ot_hrs
+    ,w_daca_dys_x_rel_dy_tk = bpi_daca_xdays
+    ,w_daca_hrs_x_rel_dy_tk = bpi_daca_xeval_hrs
+    ,w_daca_dys_f_qwl_ful = bpi_dat_fdays
+    ,w_daca_hrs_f_qwl_ful = bpi_dat_feval_hrs
+    ,w_lv_replace_trng_hrs = bpi_aux_asst_trn_hrs
+    ,w_daca_dys_t_training = bpi_daca_tdays
+    ,w_daca_hrs_t_training = bpi_daca_teval_hrs
+    ,w_daca_dys_a_ann_lv = bpi_daca_adays
+    ,w_daca_hrs_a_ann_lv = bpi_daca_aeval_hrs
+    ,w_daca_dys_o_oth_lv = bpi_daca_odays
+    ,w_daca_hrs_o_oth_lv = bpi_daca_oeval_hrs
+    ,w_daca_dys_r_rel_dys = bpi_daca_rdays
+    ,w_daca_hrs_r_rel_dys = bpi_daca_reval_hrs
+    ,w_daca_dys_3_rel_dy_50 = bpi_daca_3days
+    ,w_daca_hrs_3_rel_dy_50 = bpi_daca_3eval_hrs
+    ,w_daca_dys_5_rel_dy_150 = bpi_daca_5days
+    ,w_daca_hrs_5_rel_dy_150 = bpi_daca_5eval_hrs
+    ,w_mile_dev = bpi_mile_dev
+    ,w_hrs_aux_assist = bpi_aux_assit_hrs
+    --  103114: GDW  Added RTE 991 hour support in var_weekly fill from bpiout loaded data
+    ,w_hrs_car_ot_flsaa = bpi_reg_rte_ot_hrs_flsaa
+    ,w_hrs_a997 = bpi_reg_rte_997_hrs
+    ,w_hrs_a998 = bpi_reg_rte_998_hrs
+    ,w_hrs_a991 = bpi_reg_rte_991_hrs    
+    ,w_hrs_a999 = bpi_reg_rte_999_hrs
+    ,w_hrs_a995 = bpi_reg_rte_995_hrs
+    ,w_daca_dys_xday_bal = bpi_daca_xday_bal
+    ,w_daca_dys_s_sic_lv = bpi_daca_sdays
+    ,w_daca_hrs_s_sic_lv = bpi_daca_seval_hrs
+    ,w_daca_dys_e_lim_dty = bpi_daca_edays
+    ,w_daca_hrs_e_lim_dty = bpi_daca_eeval_hrs
+    ,w_daca_dys_p_non_ra = bpi_daca_pdays
+    ,w_daca_hrs_p_non_ra = bpi_daca_peval_hrs
+    ,w_daca_dys_b_hol_wk = bpi_daca_bdays
+    ,w_daca_hrs_b_hol_wk = bpi_daca_beval_hrs
+    ,w_daca_dys_c_cop = bpi_daca_cdays
+    ,w_daca_hrs_c_cop = bpi_daca_ceval_hrs
+    ,w_daca_dys_l_lwop = bpi_daca_ldays
+    ,w_daca_hrs_l_lwop = bpi_daca_leval_hrs
+    ,w_daca_dys_w_iod_lwop = bpi_daca_wdays
+    ,w_daca_hrs_w_iod_lwop = bpi_daca_weval_hrs
+    ,w_daca_dys_y_rel_dy_wk = bpi_daca_ydays
+    ,w_daca_hrs_y_rel_dy_wk = bpi_daca_yeval_hrs
+    ,w_sec_trip_min = bpi_sec_trip_min    
+    ,w_hrs_a992_wwl = bpi_reg_rte_992_hrs_wwl
+    ,w_hrs_a992_covid = bpi_reg_rte_992_hrs_covid
+    ,w_daca_hrs_7_wwl = bpi_daca_7eval_hrs
+    ,w_daca_dys_7_wwl = bpi_daca_7days
+    ,w_daca_hrs_8_esl = bpi_daca_8eval_hrs
+    ,w_daca_dys_8_esl = bpi_daca_8days
+    ,w_daca_hrs_9_phl = bpi_daca_9eval_hrs
+    ,w_daca_dys_9_phl = bpi_daca_9days
+from RDV_DW.dbo.hold_bpi_out with(nolock) 
+where w_fin_nbr = bpi_fin_nbr 
+and w_fy=bpi_fy 
+and w_wk=bpi_wk 
+and w_fy =@crfy;
+
+-- GDW: D/A 705, Assistant Rural Carrier, replaces obsolete 700 Temp Relief Carrier and TRC (RurArRelAct)
+IF OBJECT_ID('tempdb..#coins') IS NOT NULL BEGIN
+    DROP TABLE #coins;
+END
+
+CREATE TABLE #coins (
+    coins_fy INT,
+    coins_wk INT,
+    coins_fin_nbr_station CHAR(6),
+    coins_lnc_700 INT DEFAULT 0,
+    coins_lnc_705 INT DEFAULT 0,
+    coins_lnc_710 INT DEFAULT 0,
+    coins_lnc_720 INT DEFAULT 0,
+    coins_lnc_730 INT DEFAULT 0,
+    coins_lnc_740 INT DEFAULT 0,
+    coins_lnc_750 INT DEFAULT 0,
+    coins_lnc_760 INT DEFAULT 0,
+    coins_lnc_770 INT DEFAULT 0,
+    coins_lnc_780 INT DEFAULT 0,
+    coins_lnc_790 INT DEFAULT 0);
+
+-- Step 4:  Populate temp table #coins from Previous FY, Week 52/53, LDC 25  -- GDW 302/308/52/53 Handler
+/* 2019-01-24 wildgk; abstract F4 server name */
+
+SET @SQLCmd = '
+insert into #coins (
+    coins_fy,
+    coins_wk,
+    coins_fin_nbr_station,
+    coins_lnc_700,
+    coins_lnc_705,
+    coins_lnc_710,
+    coins_lnc_720,
+    coins_lnc_730,
+    coins_lnc_740,
+    coins_lnc_750,
+    coins_lnc_760,
+    coins_lnc_770,
+    coins_lnc_780,
+    coins_lnc_790)
+select 
+    coins_fy,
+    coins_wk,
+    coins_fin_nbr_station,
+    sum(coins_lnc_700+coins_lnc_701),
+    sum(coins_lnc_705),
+    sum(coins_lnc_710),
+    sum(coins_lnc_720),
+    sum(coins_lnc_730),
+    sum(coins_lnc_740),
+    sum(coins_lnc_750),
+    sum(coins_lnc_760),
+    sum(coins_lnc_770),
+    sum(coins_lnc_780),
+    sum(coins_lnc_790)
+from ' + @CSVServerName + '.PCSV_dw.dbo.Coins 
+where coins_ldc = 25 
+and coins_fy = ' + CAST(@crfy AS CHAR(4)) + '
+and coins_wk >= ' + CAST(@crwk - 1 AS VARCHAR(2)) + '
+group by coins_fy,coins_wk,coins_fin_nbr_station
+order by coins_fy,coins_wk,coins_fin_nbr_station;';
+
+EXEC(@SQLCmd);
+
+update RDV.dbo.var_weekly 
+set w_rur_car70_trc = coins_lnc_700,
+    w_rur_car705_arc = coins_lnc_705,
+    w_rur_car71_ft = coins_lnc_710,
+    w_rur_car72_oth = coins_lnc_720,
+    w_rur_car73_oth = coins_lnc_730,
+    w_rur_car74_rca = coins_lnc_740,
+    w_rur_car75_oth = coins_lnc_750,
+    w_rur_car76_pt = coins_lnc_760,
+    w_rur_car77_oth = coins_lnc_770,
+    w_rur_car78_rca = coins_lnc_780,
+    w_rur_car79_rca = coins_lnc_790 
+from #coins 
+where w_fin_nbr = coins_fin_nbr_station 
+and w_fy = coins_fy 
+and w_wk = coins_wk;
+
+IF OBJECT_ID('tempdb..#coins') IS NOT NULL BEGIN
+    DROP TABLE #coins;
+END
+
+update RDV.dbo.var_weekly 
+set w_rur_car_repl = (w_rur_car70_trc+w_rur_car72_oth+w_rur_car73_oth+w_rur_car74_rca+w_rur_car75_oth+
+        w_rur_car77_oth+w_rur_car78_rca+w_rur_car79_rca) 
+where w_fy = @crfy 
+and w_wk >=@crwk-1
+
+
+update RDV.dbo.var_weekly 
+set w_rur_car_tot = (w_rur_car71_ft+w_rur_car_repl+w_rur_car76_pt) 
+where w_fy = @crfy 
+and w_wk >=@crwk-1
+
+
+select 
+    sum_fy,sum_wk,sum_fin_nbr,sum(cast(sum_8127_mins as int))mins 
+into #minfill
+from RDV_DW.dbo.Import_sum8127 
+where sum_fy = @crfy 
+group by sum_fy,sum_wk,sum_fin_nbr 
+order by sum_fy,sum_wk,sum_fin_nbr
+
+
+update RDV.dbo.var_weekly 
+set w_ps_form_8127 = mins 
+from #minfill 
+where (w_fy = sum_fy and w_wk= sum_wk and w_fin_nbr =sum_fin_nbr) 
+
+drop table #minfill
+
+update rdv.dbo.var_weekly set w_hrs_ldc25=0,w_hrs_stnd=0,w_hrs_car_ot=0,w_salary_ben = 0 where w_fy =@crfy
+update RDV.dbo.var_weekly set w_hrs_ldc25 = fsh_value from RDV_DW.dbo.import_rdv_flash with(nolock) 
+where line_code = '25' and w_fin_nbr = finance_nbr and w_fy = @crfy  and w_wk=wk
+update RDV.dbo.var_weekly set w_hrs_stnd = fsh_value from RDV_DW.dbo.import_rdv_flash with(nolock) 
+where line_code = 'RSH' and w_fin_nbr = finance_nbr and w_fy = @crfy and w_wk=wk
+update RDV.dbo.var_weekly set w_salary_ben = fsh_value from RDV_DW.dbo.import_rdv_flash with(nolock) 
+where line_code = 'SB25' and w_fin_nbr = finance_nbr and w_fy = @crfy and w_wk=wk
+update RDV.dbo.var_weekly set w_hrs_car_ot = fsh_value from RDV_DW.dbo.import_rdv_flash with(nolock) 
+where line_code = 'OT25' and w_fin_nbr = finance_nbr and w_fy = @crfy and w_wk=wk
+
+-- GDW 302/308/52/53 Handler
+    --week 53 add to week 1 if last FY has only 52 weeks (incomplete Week 53)  -- GDW 302/308/52/53 Handler
+IF @ann_nbr_weeks_sply = 52 BEGIN -- Add previous FY week 53 to current FY week 1 if previous is 52 standard weeks  -- GDW 302/308/52/53 Handler
+    SET @SQLCmd = N'
+    update RDV.dbo.var_weekly 
+    set w_hrs_ldc25 = w_hrs_ldc25+fsh_25_act,
+        w_hrs_stnd = w_hrs_stnd +fsh_RSH_act,
+        w_salary_ben = w_salary_ben + fsh_SB25_act,
+        w_hrs_car_ot = w_hrs_car_ot + fsh_OT25_act
+    from ' + @CSVServerName + '.pcsv_dw.dbo.eflash with (nolock) 
+    where w_fin_nbr = fsh_fin_nbr 
+    and w_fy = ' + CAST(@crfy AS CHAR(4)) + '
+    and fsh_fy = ' + CAST(@crfy - 1 AS CHAR(4)) + '
+    and w_wk = 1 
+    and fsh_wk = 53;';
+
+    EXEC(@SQLCmd);
+END
+
+PRINT 'Var_base and Var_weekly Done'
+
+--update AMS
+PRINT 'Ams update'
+select ams_fy,ams_wk,ams_fin_nbr_station, count(ams_del_rte_num)ams_del_rte_num,
+    sum(ams_act_res_curb+ams_act_bus_curb+ams_act_res_other+ams_act_bus_other)res,
+    sum(ams_act_res_ndcbu+ams_act_bus_ndcbu+ams_act_res_central+ams_act_bus_central)cen,
+    sum(ams_act_res_curb+ams_act_bus_curb+ams_act_res_other+ams_act_bus_other+ams_act_res_ndcbu+ams_act_bus_ndcbu+ams_act_res_central+ams_act_bus_central)res_cen,
+sum(ams_act_tot)act_tot 
+into #ams_fill 
+from pcdv_dw.dbo.import_ams_new 
+where ams_rte_type = 'r' 
+and ams_del_pha_ind ='n' 
+and ams_del_rte_num <>'000'
+group by ams_fy,ams_wk,ams_fin_nbr_station
+
+update RDV.dbo.var_weekly 
+set w_ams_reg_boxes = res, w_ams_cen_boxes = cen, w_ams_tot_boxes = act_tot
+from #ams_fill 
+where ams_fy=w_fy and ams_wk=w_wk and ams_fin_nbr_station = w_fin_nbr
+
+drop table #ams_fill
+
+PRINT 'Ams update Done'
+--update Routes
+PRINT 'Routes update'
+declare @cufy int declare @cuwk int
+set @cufy = (select top 1 fy_long from PCDV_DW.dbo.workingdate with(nolock) order by fy_long)
+set @cuwk = (select top 1 wk_num from PCDV_DW.dbo.workingdate with(nolock) order by fy_long,wk_num)
+
+select re_fy,re_wk,re_fin_nbr,sum(re_box_reg)re_box_reg,sum(re_box_cent)re_box_cent,sum(re_box_reg+re_box_cent)tot_box,
+sum(case when re_pay_rte_typ = 'a' then 1 else 0 end)a_rtes,
+sum(case when re_pay_rte_typ = 'a' and re_high_den_rte_code = 'l' then 1 else 0 end)al_rtes,
+sum(case when re_pay_rte_typ = 'h' then 1 else 0 end)h_rtes,
+sum(case when re_pay_rte_typ = 'h' and re_high_den_rte_code = 'l' then 1 else 0 end)hl_rtes,
+sum(case when re_pay_rte_typ = 'j' then 1 else 0 end)j_rtes,
+sum(case when re_pay_rte_typ = 'j' and re_high_den_rte_code = 'l' then 1 else 0 end)jl_rtes,
+sum(case when re_pay_rte_typ = 'k' then 1 else 0 end)k_rtes,
+sum(case when re_pay_rte_typ = 'k' and re_high_den_rte_code = 'l' then 1 else 0 end)kl_rtes,
+sum(case when re_pay_rte_typ = 'm' then 1 else 0 end)m_rtes,
+sum(case when re_pay_rte_typ = 'm' and re_high_den_rte_code = 'l' then 1 else 0 end)ml_rtes 
+into #rurdata
+from RDV_DW.dbo.rural_extract_out with(nolock) 
+where re_rte not between 960 and 989 
+and re_rec_stat<>'d'  
+and re_fy = @cufy 
+and re_wk = @cuwk
+group by re_fy,re_wk,re_fin_nbr 
+order by re_fy,re_wk,re_fin_nbr
+
+update RDV.dbo.var_weekly 
+set 
+    w_rur_reg_boxes = re_box_reg, w_rur_cen_boxes=re_box_cent, w_rur_tot_boxes=tot_box,
+    w_rur_h_rts = h_rtes,w_rur_hl_rts=hl_rtes,w_rur_j_rts=j_rtes,w_rur_jl_rts=jl_rtes,
+    w_rur_k_rts=k_rtes,w_rur_kl_rts=kl_rtes,w_rur_m_rts=m_rtes,w_rur_ml_rts=ml_rtes,
+    w_rur_l_rts=hl_rtes+jl_rtes+kl_rtes+ml_rtes,w_rur_reg_rts=h_rtes+j_rtes+k_rtes+m_rtes,
+    w_rur_aux_rts=a_rtes,w_rur_tot_rts=a_rtes+h_rtes+j_rtes+k_rtes+m_rtes
+from #rurdata with(nolock) 
+where (w_fin_nbr=re_fin_nbr and w_fy=re_fy and w_wk=re_wk) or (w_fin_nbr=re_fin_nbr and w_fy=re_fy and w_wk+1=re_wk)
+
+drop table #rurdata
+select re_fy,re_wk,re_fin_nbr,sum(case when re_pay_rte_typ = 'k' and re_eval_hrs between 47 and 48 and re_rte not between 960 and 989 
+then 1 else 0 end)ovbn_rte,sum(case when re_rte between 960 and 989 then 1 else 0 end)iod_rtes into #rurdata1
+from RDV_DW.dbo.rural_extract_out with(nolock) where re_rec_stat<>'d'   and re_fy = @cufy and re_wk = @cuwk
+group by re_fy,re_wk,re_fin_nbr order by re_fy,re_wk,re_fin_nbr
+update RDV.dbo.var_weekly set w_rur_ovrburden_rts = ovbn_rte, w_rur_iod_rts=iod_rtes
+from #rurdata1 with(nolock) where (w_fin_nbr=re_fin_nbr and w_fy=re_fy and w_wk=re_wk) or (w_fin_nbr=re_fin_nbr and w_fy=re_fy and w_wk+1=re_wk)
+drop table #rurdata1
+select re_fy,re_wk,re_fin_nbr,sum(re_miles)re_miles into #mles From RDV_DW.dbo.rural_extract_out  where re_fy = @cufy and re_wk = @cuwk 
+group by re_fy,re_wk,re_fin_nbr order by re_fy,re_wk,re_fin_nbr
+update RDV.dbo.var_weekly set w_base_miles = re_miles from #mles
+where (w_fin_nbr=re_fin_nbr and w_fy=re_fy and w_wk=re_wk) or (w_fin_nbr=re_fin_nbr and w_fy=re_fy and w_wk+1=re_wk)
+drop table #mles
+update RDV.dbo.var_weekly set w_fyppwk = (((cal_yr_pp*100)+cal_pp_nbr)*10)+cal_pp_wk
+from pcdv_dw.dbo.master_calendar with(nolock)
+where cal_fy_long = w_fy and cal_fy_wk=w_wk and w_fyppwk is null
+select vac_fin_nbr,vac_fy,vac_wk,count(*)cnt into #varrte from RDV_DW.dbo.rur_vacant 
+group by vac_fin_nbr,vac_fy,vac_wk order by vac_fin_nbr,vac_fy,vac_wk
+update RDV.dbo.var_weekly set w_rur_vacant_rts = cnt from #varrte
+where w_fin_nbr=vac_fin_nbr and w_fy=vac_fy and w_wk = vac_wk
+drop table #varrte
+PRINT 'Routes update Done'
+--process pic
+print 'begin area 4Z route summary'
+EXEC RDV.dbo.sp_rdv_area_cluster_routes            -- Moved here from PICK Processor
+print 'finished area 4Z route summary'
+PRINT 'Calendar update'
+exec RDV.dbo.sp_rdv_ProcessPickCalendar2010
+PRINT 'Calendar Update Done'
+
+-- per HQ Rural: insert new routes (finance numbers) into rural tracker when within update window
+-- which is 30 days prior to user activation date.
+
+SELECT @CountStart = pc_routes_update_date, @Today = GETDATE()
+FROM rdv.dbo.rdv_cnt_dates;
+
+SELECT @DaySpan = FLOOR(DATEDIFF(DAY, @Today, @CountStart));
+
+IF @DaySpan BETWEEN 0 AND 29 BEGIN
+    INSERT INTO rdv.dbo.rdv_cnt_routes (
+         c_area
+        ,c_cluster
+        ,c_fin_nbr
+        ,c_lead_name
+        ,c_fin_name
+        ,c_mpoo
+        ,c_zip
+        ,c_rte_nbr
+        ,rte_active
+        ,c_fy)
+    SELECT 
+         b_area Area
+        ,b_cluster Cluster
+        ,bpi_fin_nbr FinNbr
+        ,b_lead_name LeadName
+        ,b_fin_name Name
+        ,b_mpoo MPOO
+        ,bpi_zip+bpi_zip_four Zip
+        ,bpi_rte [Route]
+        ,1 Active
+        ,@crfy FY
+    FROM rdv.dbo.var_base WITH(NOLOCK), rdv_dw.dbo.bpi_out WITH(NOLOCK)
+    WHERE b_fin_nbr=bpi_fin_nbr 
+    AND bpi_fy=@crfy 
+    AND bpi_wk=@crwk
+    AND bpi_fin_nbr NOT IN (SELECT c_fin_nbr FROM rdv_cnt_routes WITH(NOLOCK) GROUP BY c_fin_nbr)
+    AND CAST(bpi_rte AS INT) BETWEEN 1 AND 959
+    ORDER BY  b_area, b_cluster, bpi_fin_nbr, bpi_rte;
+END   
+    
+--2022-12-09 wildgk. Use new lock/unlock mechanism.
+exec var_servers.dbo.usp_application_lock_unlock
+     @entityIdentifier = 'RDV'
+    ,@lockInd = 0
+    ,@groupLockUnlockInd = 1;
+
+--  2015-01-14: GDW  Support the move of rur_vacant.csv to E:\Data\RURAL\Backup
+declare @Copy_rur_vacant varchar(255)
+declare @del_rur_vacant varchar(255)
+        set @Copy_rur_vacant = 'copy E:\Data\Rural\rur_vacant.csv E:\Data\Rural\Backup\rur_vacant.csv'
+        set @del_rur_vacant = 'del E:\Data\Rural\rur_vacant.csv'
+        exec master..xp_cmdshell @Copy_rur_vacant
+        exec master..xp_cmdshell @del_rur_vacant
+
+/* NEED TO UNCOMMENT THESE FOR PROD
+
+--EXECUTE rdv.dbo.sp_F2A_Lean_Matrix_Table_Build;
+
+--EXECUTE rdv.dbo.sp_rdv_dms_aft;    --    2018-11-29: CBA
+*/
+
+END
