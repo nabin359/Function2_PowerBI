@@ -1,0 +1,173 @@
+USE [RDV_DW]
+GO
+/****** Object:  StoredProcedure [dbo].[pr_generate_rural_extract]    Script Date: 1/22/2026 10:29:01 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- =============================================
+-- Authors:			CBA/JWILD
+-- Create date: 20190606
+-- Description:	Converts regular csv file to signed overpunch file necessary for rural refresh
+--							Source data to be migrated from Eagan to St Louis (RMSS) in Winter 2020
+--							RMSS does not have the data in signed overpunch format, necessitating this loader
+--							Creating a signed overpunch file means we could leave the regular process untouched, thus lower risk this way
+-- =============================================
+ALTER PROCEDURE [dbo].[pr_generate_rural_extract]
+AS
+BEGIN
+
+BEGIN TRY
+
+--ingest raw data
+truncate table dbo.import_rural_webservice_extract;
+
+declare 
+@SQL_Command varchar(4000),
+@FileName varchar(100) = '';
+
+select @FileName = data_file_path + data_file_name
+from rdv_dw.dbo.rural_extract_web_service_meta with (nolock);
+
+SET @SQL_Command = 'BULK INSERT rdv_dw.dbo.vw_import_rural_webservice_extract from ''' + 
+						    @FileName + '''' + ' WITH (FIRSTROW=1, FIELDTERMINATOR= '','', ROWTERMINATOR=''\n'')';
+
+EXEC (@SQL_Command);
+
+--cursor based solution using format table
+declare @serverColName varchar(50)
+	,@length int
+	,@padding varchar(50)
+	,@overpunch bit
+	,@side char(1)
+	,@trueFalse bit
+	,@decMultiplier varchar(3)
+	,@webName varchar(50)
+	,@SQLCmd varchar(4000)
+    ,@ErrorMessage nvarchar(2048);
+
+declare overpunchCursor cursor for
+select server_column_name
+			, host_file_data_length
+			, coalesce(column_padding_ascii_code,48) --some not padded because we expect full length data, but can't pass Null to dynamic SQL so use coalesce here and pad them as L
+			, column_is_overpunch
+			, coalesce(column_padding_side,'L') --some not padded because we expect full length data, but can't pass Null to dynamic SQL so use coalesce here and pad them as L
+			, true_false_indicator --where the raw data will spell out True or False, we need to convert to single Y or N
+			, cast(decimal_multiplier as varchar(3)) --convert it here to make it easier in dynamic sql below
+			, webservice_column_name --in conjunction with column_is_overpunch determines fields we won't get data for but need to be overpunched 0
+from dbo.rural_extract_format_meta
+order by host_file_field_order;
+
+open overpunchCursor;
+
+
+declare @wasPrinted INT = 0;
+
+
+fetch next from overpunchCursor into @serverColName, @length, @padding, @overpunch, @side, @trueFalse, @decMultiplier, @webName;
+
+while @@fetch_status = 0
+begin
+
+
+begin try
+
+set @SQLCmd = N'';
+
+--True/False logic is specific to each column
+if @trueFalse = 1 and @serverColName = 're_high_den_rte_code'
+		set @SQLCmd = 
+		N'update t1
+		set ' + @serverColName + '= case when ' + @serverColName + ' = ''True'' then ''L'' else '' '' end
+		from dbo.import_rural_webservice_extract t1;';
+
+if @trueFalse = 1 and @serverColName = 're_sea_rte'
+		set @SQLCmd = 
+		N'update t1
+		set ' + @serverColName + '= case when ' + @serverColName + ' = ''True'' then ''S'' else '' '' end
+		from dbo.import_rural_webservice_extract t1;';
+
+if @trueFalse = 1 and @serverColName = 're_in_sea_ind' 
+		set @SQLCmd =
+		N'update t1
+		set ' + @serverColName + '= case when ' + @serverColName + ' = ''True'' then ''Y'' when ' + @serverColName + ' = ''False'' and re_sea_rte = ''S'' then ''N'' else '' '' end
+		from dbo.import_rural_webservice_extract t1;';        
+
+if @trueFalse = 1 and @serverColName = 're_detour_route' --source data only contains True/False.
+        set @SQLCmd = 
+        N'update t1
+        set ' + @serverColName + '= case when ' + @serverColName + ' = ''True'' then ''Y'' else ''N'' end
+        from dbo.import_rural_webservice_extract t1;';
+
+--Remaining columns i.e. non-True/False
+if @overpunch = 1 and @trueFalse = 0 and @webName <> '' --overpunch always left padded (concat padding with field and take rightmost char)		       
+        set @SQLCmd = 
+		N'update t1
+		set ' +@serverColName+ ' = STUFF(right(concat(replicate(char(' +@padding+ '), ' +cast(@length as varchar(3))+ '), abs(cast(cast(' +@serverColName+ ' as numeric(10,2)) * ' + @decMultiplier + ' as int))),' +cast(@length as varchar(3))+ '), ' +cast(@length as varchar(3))+ ', 1, code)
+		from dbo.import_rural_webservice_extract t1, dbo.overpunch t2
+		where (case when CAST(' +@serverColName+ ' as numeric(10,2)) * ' + @decMultiplier + ' = 0 then 1 else cast(cast(' +@serverColName+ ' as numeric(10,2)) * ' + @decMultiplier + ' as int)/abs(cast(cast(' +@serverColName+ ' as numeric(10,2)) * ' + @decMultiplier + ' as int)) end) = multiplier
+		and right(cast(cast(' +@serverColName+ ' as numeric(10,2)) * ' + @decMultiplier + ' as int) ,1) = digit;';
+
+if @overpunch = 1 and @webName = '' and @trueFalse = 0 --fields we won't get data for but need to be overpunched 0
+		set @SQLCmd = 
+		N'update t1
+		set ' +@serverColName+ ' = STUFF(right(concat(replicate(char(' +@padding+ '), ' +cast(@length as varchar(3))+ '), abs(cast(cast(' +@serverColName+ ' as numeric(10,2)) * ' + @decMultiplier + ' as int))),' +cast(@length as varchar(3))+ '), ' +cast(@length as varchar(3))+ ', 1, code)
+		from dbo.import_rural_webservice_extract t1, dbo.overpunch t2
+		where multiplier = 1;'; --force it to use positive 0 code
+
+if @overpunch = 0 and @side = 'L' and @trueFalse = 0 --left padded (concat padding with field and take rightmost char)
+		set @SQLCmd = 
+		N'update t1
+		set ' +@serverColName+ ' = right(concat(replicate(char(' +@padding+ '), ' +cast(@length as varchar(3))+ '), ' +@serverColName+ '),' +cast(@length as varchar(3))+ ')
+		from dbo.import_rural_webservice_extract t1;';
+		
+if @overpunch = 0 and @side = 'R' and @trueFalse = 0 --right padded (concat field with padding and take leftmost char)
+		set @SQLCmd = 
+		N'update t1
+		set ' +@serverColName+ ' = left(concat(' +@serverColName+ ', replicate(char(' +@padding+ '), ' +cast(@length as varchar(3))+ ')),' +cast(@length as varchar(3))+ ')
+		from dbo.import_rural_webservice_extract t1;';
+
+exec (@SQLCmd);
+
+end try
+begin catch
+
+PRINT @SQLCmd;
+
+set @ErrorMessage = CONCAT('ERROR on column ', @serverColName, ' on line ', ERROR_LINE(), '; Message: ', ERROR_MESSAGE());
+
+throw 51000, @ErrorMessage, 1;
+
+end catch
+
+
+fetch next from overpunchCursor into @serverColName, @length, @padding, @overpunch, @side, @trueFalse, @decMultiplier, @webName;
+
+end -- end cursor
+
+close overpunchCursor;
+deallocate overpunchCursor;
+
+--use a view that concats all fields in proper order and bcp out to rural_extract.DAT
+declare 
+    @export_to_rural_extract_dat varchar(4000)
+	,@filestamp char(16);
+
+exec var_servers.dbo.pr_get_filestamp @filestamp = @filestamp output;
+
+set @export_to_rural_extract_dat = 'bcp "SELECT * FROM rdv_dw.dbo.vw_import_rural_webservice_extract_output" queryout e:\data\Rural\RURAL_EXTRACT' + @filestamp + '.DAT -c -T -t,';
+
+exec master..xp_cmdshell @export_to_rural_extract_dat;
+
+end try
+begin catch
+
+set @ErrorMessage = CONCAT('ERROR on line ', ERROR_LINE(), '; Message: ', ERROR_MESSAGE());
+
+throw 51000, @ErrorMessage, 1;
+
+end catch
+
+
+END
+
