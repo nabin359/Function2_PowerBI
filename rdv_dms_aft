@@ -1,0 +1,153 @@
+USE [RDV]
+GO
+/****** Object:  StoredProcedure [dbo].[sp_rdv_dms_aft]    Script Date: 1/22/2026 10:18:33 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- =============================================
+-- Author:			CAtchley
+-- Created:			2018-NOV-29
+-- Description:	RDV data to DMS bi-weekly
+--							Originally based on OIG data extract, left other possible metrics commented out in case they are needed later
+--							DMS team would prefer to have a locale key or fdb_id, but we determined there was not a 100% accurate way to provide that
+--							LDC 25 hours and standard hours are coming from eFlash, no locale key or fdb_id
+-- 20181212:		CBA change to using global temp table ##tempRDVDMS
+-- 20181212:		CBA fix bcp statement adding double quotation mark where required
+-- =============================================
+ALTER PROCEDURE [dbo].[sp_rdv_dms_aft]
+
+AS
+BEGIN
+
+	SET NOCOUNT ON;
+	SET ANSI_WARNINGS ON;
+	SET ANSI_NULLS ON;
+
+	DECLARE @AFT_FileName VARCHAR(255)
+	DECLARE @AFT_FilePath VARCHAR(255)
+	SET @AFT_FilePath = 'E:\Data\DMS\'
+	SET @AFT_FileName = 'vm_dms_rural_data' + '.DAT'
+	SELECT @AFT_FileName
+
+DECLARE @fiscal_year INT;
+SET @fiscal_year = (SELECT TOP 1 fy_long FROM pcdv_dw.dbo.workingdate ORDER BY fy_long);
+DECLARE @current_wk INT;
+SET @current_wk = (SELECT TOP 1 wk_num FROM pcdv_dw.dbo.workingdate ORDER BY fy_long,wk_num);
+
+IF OBJECT_ID('tempdb..#tempCal') IS NOT NULL BEGIN DROP TABLE #tempCal END;
+
+SELECT cal_fy_long, cal_fy_wk, CAST(MIN(cal_date_beg_wk) AS DATE) week_start_date
+INTO #tempCal 
+FROM PCDV_DW.dbo.Master_Calendar
+GROUP BY cal_fy_long, cal_fy_wk
+
+IF OBJECT_ID('tempdb..##tempRDVDMS') IS NOT NULL BEGIN DROP TABLE ##tempRDVDMS END;
+
+SELECT  w_fy FY,
+				w_wk WK,
+				week_start_date WEEK_BEGIN,
+				--w_fyppwk FYPPWK,
+				--b_area AREA,
+				--b_area_name ANAME,
+				--b_cluster DISTRICT,
+				--b_cluster_name DNAME,
+				--b_fin_name FACILITY,
+				rdb.b_fin_nbr FIN_NBR,
+				--csb.b_fdb_id FDB_ID, --decided against using CSV FDB_ID due to concerns the data would be split the wrong way and that CSV uses FDB_ID for window hours, not rural assignment
+				--b_mpoo MPOO,
+        --SUM(w_del_days) del_days,
+        --tot_rts=(SELECT SUM(w_rur_tot_rts) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --reg_rts=(SELECT SUM(w_rur_reg_rts) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --aux_rts=(SELECT SUM(w_rur_aux_rts) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --vacant_rts=(SELECT SUM(w_rur_vacant_rts) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --overburdened_rts=(SELECT SUM(w_rur_ovrburden_rts) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --iod_rts=(SELECT SUM(w_rur_iod_rts) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car_tot=(SELECT SUM(w_rur_car_tot) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car70_trc=(SELECT SUM(w_rur_car70_trc) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car71_ft=(SELECT SUM(w_rur_car71_ft) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car72_oth=(SELECT SUM(w_rur_car72_oth) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car73_oth=(SELECT SUM(w_rur_car73_oth) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car74_rca=(SELECT SUM(w_rur_car74_rca) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car75_oth=(SELECT SUM(w_rur_car75_oth) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car76_pt=(SELECT SUM(w_rur_car76_pt) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car77_oth=(SELECT SUM(w_rur_car77_oth) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car78_rca=(SELECT SUM(w_rur_car78_rca) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --car79_rca=(SELECT SUM(w_rur_car79_rca) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --replacement_carriers= (SELECT SUM(w_rur_car70_trc)+SUM(w_rur_car72_oth)+SUM(w_rur_car73_oth)+SUM(w_rur_car74_rca)+SUM(w_rur_car75_oth)+SUM(w_rur_car76_pt)+SUM(w_rur_car77_oth)+SUM(w_rur_car78_rca)+SUM(w_rur_car79_rca) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        --arc_carriers=(SELECT SUM(w_rur_car705_arc) FROM dbo.var_weekly WITH (NOLOCK) WHERE b_fin_nbr=w_fin_nbr AND (w_fy*100)+w_wk = (@fiscal_year * 100) + @q1_last_week GROUP BY w_fin_nbr),
+        SUM(w_hrs_ldc25) LDC25_HRS,
+        SUM(w_hrs_stnd) STANDARD_HRS,
+        SUM(w_hrs_a991) A991_HRS
+        --SUM(w_hrs_ldc25 - w_hrs_a991) ldc25_wo_a991_hrs,
+        --SUM(w_hrs_ldc25 - w_hrs_stnd) var_hrs,
+        --SUM(w_hrs_ldc25 - w_hrs_a991) - SUM(w_hrs_stnd) var_hrs_wo_a991,
+        --SUM(w_hrs_ldc25)-((SUM(w_hrs_stnd)*r_pct_stnd)+SUM(w_hrs_stnd)) opp_hrs,
+        --SUM(w_hrs_car_ot) car_ot_hrs,
+        --SUM(w_hrs_rpl_ot) rpl_ot_hrs,
+        --SUM(w_hrs_aux_assist) aux_assist_hrs,
+        --SUM(w_hrs_a998+w_hrs_a999) aux_assist9_hrs,
+        --SUM(w_salary_ben) salary_ben,
+        --CASE WHEN SUM(w_rur_tot_boxes)=0 THEN 0 ELSE SUM(w_rur_tot_boxes) END tot_rur_boxes
+        --SUM(w_rur_tot_boxes*w_del_days) tot_boxes
+		INTO ##tempRDVDMS --change to local table before PROD
+    FROM dbo.avar_rdv_prod WITH (NOLOCK),
+        dbo.var_base rdb WITH (NOLOCK)
+            INNER JOIN dbo.var_weekly WITH (NOLOCK)
+                ON rdb.b_fin_nbr = w_fin_nbr
+						INNER JOIN #tempCal
+								ON w_fy = cal_fy_long
+									AND w_wk = cal_fy_wk
+						--LEFT JOIN eagnmnsg392.pcsv_dw.dbo.var_base csb  --decided against using CSV FDB_ID due to concerns the data would be split the wrong way and that CSV uses FDB_ID for window hours, not rural assignment
+						--		ON w_fin_nbr = csb.b_fin_nbr				
+    WHERE rdb.b_rdv_ind=1
+			AND rdb.b_mpoo <> 'X'
+			AND w_fy = @fiscal_year
+			AND w_wk <= @current_wk
+    GROUP BY  w_fy,
+							w_wk,
+							week_start_date,
+							--w_fyppwk,
+							--b_area,
+							--b_area_name,
+							--b_cluster_name,
+							--b_lead_fin_nbr,
+							--b_fin_name,
+							--b_cluster,
+							rdb.b_fin_nbr
+							--csb.b_fdb_id --decided against using CSV FDB_ID due to concerns the data would be split the wrong way and that CSV uses FDB_ID for window hours, not rural assignment
+							--b_mpoo,
+							--r_pct_stnd,
+							--b_rur_rte_nbr,
+							--b_hrs_ldc25,
+							--b_rur_aux_rte_nbr,
+							--b_h_rtes_nbr,
+							--b_j_rtes_nbr,
+							--b_k_rtes_nbr,
+							--b_m_rtes_nbr,
+							--b_vacant_rtes_nbr
+		ORDER BY w_fy,
+						 w_wk,
+						 rdb.b_fin_nbr
+
+						 
+/* output data to aft file */
+	DECLARE @bcp_aft VARCHAR(255)
+	SET @bcp_aft = 'bcp "SELECT * FROM ##tempRDVDMS ORDER BY FY, WK, WEEK_BEGIN, FIN_NBR" queryout ' + @AFT_FilePath + @AFT_FileName +  ' -c -T -t,'
+		--PRINT @bcp_aft;
+		--SELECT * FROM ##tempRDVDMS ORDER BY FY, WK, WEEK_BEGIN, FIN_NBR
+	EXEC master..xp_cmdshell @bcp_aft
+
+/* run aft cmd file to aft file to customer */
+/* file cleanup done in cmd file */
+	DECLARE @aft_cmd VARCHAR(255)
+	SET @aft_cmd = 'E:\Data\AFTScript\VMDMST\aft_VMDMST_Rur_DMS.cmd'
+		--PRINT @aft_cmd
+	EXEC master..xp_cmdshell @aft_cmd
+
+/*housekeeping*/
+	DROP TABLE ##tempRDVDMS;
+	DROP TABLE #tempCal;
+
+END
