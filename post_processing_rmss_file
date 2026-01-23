@@ -1,0 +1,39 @@
+#[Net.ServicePointManager]::SecurityProtocol = "tls12";
+
+$Server = "eagnmnwbp1664"; #SQL Server Instance.
+$Src_Database = "rdv_dw"; #Database
+$PayData_con = New-Object Data.SqlClient.SqlConnection; 
+$PayData_con.ConnectionString = "Data Source=$Server;" +  
+                        "Integrated Security=True;" + 
+                        "Initial Catalog=$Src_Database";
+                        
+$PayData_Sql = "select 
+    data_file_path + data_file_name data_file,
+    backup_path 
+from rdv_dw.dbo.rural_extract_web_service_meta with (nolock);";
+                        
+$PayData_con.Open();
+$PayData_cmd = New-Object Data.SqlClient.SqlCommand $PayData_Sql, $PayData_con;
+$PayData_rd = $PayData_cmd.ExecuteReader();
+$PayYrWk = [string]"";
+$URI = [string]"";
+$OutputPathFile = [string]"";
+$BackupPath = [string]"";
+
+While ($PayData_rd.Read()) {
+    $OutputPathFile = $PayData_rd.GetValue(0);
+    $BackupPath = $PayData_rd.GetValue(1);
+}
+
+$PayData_rd.Close();
+$PayData_cmd.Dispose();
+$PayData_con.Close();
+
+$FileStamp = "_" + [System.DateTime]::Now.ToString("yyyyMMdd_HHmmss");
+
+if (Test-Path $OutputPathFile) {
+  $file   = [io.path]::GetFileNameWithoutExtension($OutputPathFile);
+  $ext    = [io.path]::GetExtension($OutputPathFile);
+  $Target = $BackupPath + $file + $FileStamp + $ext;
+  Move-Item $OutputPathFile $Target;
+}
