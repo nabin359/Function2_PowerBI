@@ -1,4 +1,32 @@
 
+SELECT
+    bpi_fin_nbr,
+    bpi_fy,
+    bpi_wk,
+    COUNT(*) AS row_cnt,
+    STRING_AGG(CAST(bpi_pp AS varchar(10)), ',') AS pp_list
+FROM RDV_DW.dbo.hold_bpi_out
+WHERE bpi_fy = 2026
+  AND bpi_wk IN (6,7)
+GROUP BY bpi_fin_nbr, bpi_fy, bpi_wk
+HAVING COUNT(*) > 1
+ORDER BY row_cnt DESC;
+
+
+SELECT
+    cal_fy_long,
+    cal_fy_wk,
+    COUNT(DISTINCT CONCAT(cal_yr_pp,'-',cal_pp_nbr,'-',cal_pp_wk)) AS distinct_pp_keys
+FROM pcdv_dw.dbo.master_calendar
+WHERE cal_fy_long = 2026
+  AND cal_fy_wk IN (6,7)
+GROUP BY cal_fy_long, cal_fy_wk
+HAVING COUNT(DISTINCT CONCAT(cal_yr_pp,'-',cal_pp_nbr,'-',cal_pp_wk)) > 1;
+
+
+
+
+
 USE [PCSV_dw];
 GO
 
