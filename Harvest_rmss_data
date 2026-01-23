@@ -1,0 +1,87 @@
+[Net.ServicePointManager]::SecurityProtocol = "tls12";
+
+$Server = "eagnmnwbp1664"; #SQL Server Instance.
+$Src_Database = "rdv_dw"; #Database
+$PayData_con = New-Object Data.SqlClient.SqlConnection; 
+$PayData_con.ConnectionString = "Data Source=$Server;" +  
+                        "Integrated Security=True;" + 
+                        "Initial Catalog=$Src_Database";
+                        
+$PayData_Sql = "declare 
+@MaxFYWk int,
+@PayYear char(4),
+@PayNbr varchar(2),
+@PayYrNbr varchar(6),
+@URIBase varchar(255),
+@RecordsPerPage varchar(255),
+@DataPathFile varchar(255),
+@BackupPath varchar(255);
+
+select @MaxFYWk = max(re_ppfy*100 + re_ppwk) 
+from rdv_dw.dbo.rural_extract_out with (nolock);
+
+select 
+    @URIBase = web_service_base_url,
+    @RecordsPerPage = cast(records_per_page as varchar(255)),
+    @DataPathFile = data_file_path + data_file_name,
+    @BackupPath = backup_path 
+from rdv_dw.dbo.rural_extract_web_service_meta with (nolock);
+
+select
+    @PayYrNbr = cast(pay_year as char(4)) + right('0' + cast(pay_period as varchar(2)), 2),
+    @PayYear = cast(pay_year as char(4)),
+    @PayNbr = right('0'+cast(pay_period  as varchar(2)), 2)
+from pcdv_dw.dbo.Master_Calendar_daily
+where pay_year * 100 + pay_period > @MaxFYWk 
+order by variance_full_week desc;
+
+select 
+    @PayYrNbr PayYrNbr,
+    @URIBase + @PayNbr + '&payPeriodYear=' + @PayYear + '&size=' + @RecordsPerPage URI,
+    @DataPathFile data_file,
+    @BackupPath backup_path;";
+                        
+                        
+$PayData_con.Open();
+$PayData_cmd = New-Object Data.SqlClient.SqlCommand $PayData_Sql, $PayData_con;
+$PayData_rd = $PayData_cmd.ExecuteReader();
+$PayYrWk = [string]"";
+$URI = [string]"";
+$OutputPathFile = [string]"";
+$BackupPath = [string]"";
+
+While ($PayData_rd.Read()) {
+    $PayYrWk = $PayData_rd.GetValue(0);
+    $URI = $PayData_rd.GetValue(1);
+    $OutputPathFile = $PayData_rd.GetValue(2);
+    $BackupPath = $PayData_rd.GetValue(3);
+}
+
+$PayData_rd.Close();
+$PayData_cmd.Dispose();
+$PayData_con.Close();
+
+#convert the string variable for insertion into the data set
+$PayYrNum = [int]$PayYrWk.Substring(0,4);
+$PayWkNum = [int]$PayYrWk.Substring(4);
+$PayYrWkNum = $PayYrNum * 100 + $PayWkNum;
+
+$FileStamp = "_" + [System.DateTime]::Now.ToString("yyyyMMdd_HHmmss");
+
+if (Test-Path $OutputPathFile) {
+  $file   = [io.path]::GetFileNameWithoutExtension($OutputPathFile);
+  $ext    = [io.path]::GetExtension($OutputPathFile);
+  $Target = $BackupPath + $file + $FileStamp + $ext;
+  Move-Item $OutputPathFile $Target;
+}
+
+Invoke-WebRequest -Method GET -Uri $URI -UseBasicParsing |
+ ConvertFrom-Json |
+ Select-Object -ExpandProperty  data |
+ #Select-Object -Property finance,routeNumber,bankTime,finDataCtrlNo,routeType,routeEval,routeLength,stops,vehicleType,rotatingRelief,lockPouchRate,lockPouchStops,detour,detourMiles,seasonal,inSeason,seasonalMiles,seasonalRegularBoxes,seasonalCentralizedBoxes,optionElection,regularBoxes,centralizedBoxes,volumeOnly,ema,dismounts,dismountFeet,collectionCompartments,parcelLockers,ppYear,ppNumber,lroute,routeMilesRounded,standardHours,standardMinutes,routeStatus,auxPayType,effectiveYearPeriod,processedYearPeriod,recordId,seasonalYearPeriod,ppYearPpNumber | 
+ #Select-Object -Property finance,routeNumber,effectiveYearPeriod,routeType,optionElection,routeEval,routeMilesRounded,stops,regularBoxes,centralizedBoxes,volumeOnly,lroute,vehicleType,ema,lockPouchRate,routeLength,standardHours,standardMinutes,bankTime,lockPouchStops,dismounts,dismountFeet,detour,detourMiles,seasonal,seasonalYearPeriod,inSeason,seasonalMiles,seasonalRegularBoxes,seasonalCentralizedBoxes,collectionCompartments,parcelLockers,@{Name='ppYearPpNumber';Expression={$PayYrWkNum}} | 
+ Select-Object -Property finance,routeNumber,effectiveYearPeriod,routeType,optionElection,routeEval,routeMilesRounded,stops,regularBoxes,centralizedBoxes,volumeOnly,lroute,vehicleType,ema,lockPouchRate,routeLength,standardHours,standardMinutes,bankTime,lockPouchStops,dismounts,dismountFeet,detour,detourMiles,seasonal,seasonalYearPeriod,inSeason,seasonalMiles,seasonalRegularBoxes,seasonalCentralizedBoxes,collectionCompartments,parcelLockers,ppYearPpNumber | 
+ ConvertTo-CSV -NoTypeInformation |
+ Select -Skip 1 |
+ % {$_.Replace('"','')} |
+Set-Content $OutputPathFile;
