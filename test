@@ -1,4 +1,11 @@
 
+As a Workhour Efficiency Analyst, I oversee day-to-day data quality checks, run ad hoc and recurring queries, and maintain City Delivery Variance (CDV) reporting data. Recently, I built a Flex Time website that enables employees to submit requests and allows administrators to review and approve them. I also developed a Power BI dashboard to support peak-season operations by providing timely visibility into Arrival at Unit and Stop-the-Clock scan performance, helping teams evaluate office performance and identify locations that need additional support. Currently, I am working on a modernization effort to build our data platform in Databricks so we can reduce reliance on traditional DBMS infrastructure.
+
+
+
+
+
+
 SELECT
     bpi_fin_nbr,
     bpi_fy,
