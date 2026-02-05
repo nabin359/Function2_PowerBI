@@ -1,3 +1,30 @@
+CASE 
+  WHEN b_vol_dps_pcs = 0 THEN 0
+  ELSE 
+    CAST(b_vol_dps_pcs AS DECIMAL(18,2)) /
+    ((b_am_cas_ltr_pcs + b_pm_cas_ltr_pcs) + b_vol_dps_pcs)
+END AS bdps_pct
+
+
+CASE 
+  WHEN SUM(w_vol_dps_ltr) = 0 THEN 0
+  ELSE
+    1 - (
+      CAST(SUM(cd_ern_cas_ltr_pcs) AS DECIMAL(18,2)) /
+      (SUM(w_vol_cas_ltr) + SUM(w_vol_dps_ltr))
+    )
+END AS adps_pct
+
+
+
+
+
+
+
+
+
+
+
 --Base Total Manual Volume
 
 CASE 
