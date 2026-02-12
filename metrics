@@ -1,3 +1,88 @@
+# Equivalent DOIS Base
+
+var_weekly
+
+w_ern_dois_rtes
+w_wk
+
+SUM(w_ern_dois_rtes) / COUNT(w_wk) AS w_ern_dois_rtes
+
+Calculation Description:
+Calculates the average DOIS earned routes per week across the selected fiscal week range.
+
+
+
+# Earned Routes – Equivalent Workload
+
+var_calc_cdv, var_weekly, avar_cdv_prod
+
+cd_ern_hrs_ldc21
+cd_ern_hrs_ldc22
+cd_ern_hrs_ldc26
+w_del_days
+prod_fters_fact
+
+CASE WHEN b_collection_unit_ind = 1 THEN 0
+ELSE
+  (((SUM(cd_ern_hrs_ldc21 + cd_ern_hrs_ldc22 + cd_ern_hrs_ldc26)
+      * prod_fters_fact)
+     / SUM(w_del_days)) / 8)
+END AS structEarned
+
+Calculation Description:
+Converts earned office/street hours into equivalent earned routes:
+Sum earned hours (21 + 22 + 26)
+Adjust by productivity factor (prod_fters_fact)
+Divide by delivery days to normalize daily
+Divide by 8 hours to convert to route equivalents
+
+
+# Actual Routes – Equivalent Work Hours
+
+var_weekly, avar_cdv_prod
+
+w_hrs_ldc21
+w_hrs_ldc22
+w_hrs_ldc26
+w_hrs_ldc29
+w_del_days
+prod_fters_fact
+
+
+CASE WHEN b_collection_unit_ind = 1 THEN 0
+ELSE
+  (((SUM(w_hrs_ldc21 + w_hrs_ldc22 + w_hrs_ldc26 + w_hrs_ldc29)
+      * prod_fters_fact)
+     / SUM(w_del_days)) / 8)
+END AS actRoutes
+
+
+Calculation Description:
+Converts actual office/street hours into equivalent actual routes:
+Sum actual LDC hours (21 + 22 + 26 + 29)
+Apply productivity factor
+Normalize per delivery day
+Convert hours to route equivalents (÷ 8)
+
+
+# Daily Pivot Opportunity
+
+
+CASE WHEN b_collection_unit_ind = 1 THEN 0
+ELSE
+  ((SUM(w_ern_dois_rtes) / COUNT(w_wk))
+   - (((SUM(cd_ern_hrs_ldc21 + cd_ern_hrs_ldc22 + cd_ern_hrs_ldc26)
+        * prod_fters_fact)
+       / SUM(w_del_days)) / 8))
+END AS ProjActRteReduction
+
+
+This represents the daily route reduction opportunity based on earned workload compared to DOIS route structure.
+
+
+
+
+
 CASE 
   WHEN b_vol_dps_pcs = 0 THEN 0
   ELSE 
